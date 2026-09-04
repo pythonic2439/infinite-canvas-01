@@ -1,0 +1,41 @@
+---
+title: Canvas Node Guide
+description: Main canvas node workflows and operations
+---
+
+# Canvas Node Guide
+
+## Text nodes
+
+Text nodes store prompts, drafts, descriptions, and AI-generated text. Double-click the content or select **Edit Text** in the toolbar to edit it. The toolbar also controls text size.
+
+Select **Edit** to open the prompt panel below the node:
+
+- An empty node generates text into itself.
+- Editing an existing node creates a connected result node to the right, preserving the original.
+- Use `@` to reference connected images, text, video, or audio. Image references appear as thumbnails and are numbered automatically when sent to the model.
+- The model selection applies only to the current node. Fetch or enter model names in global Settings first.
+
+To generate an image from text, prepare the prompt and select **Generate Image**. Infinite Canvas creates and connects a generation configuration node, starts generation, and lets you adjust the model, aspect ratio, and output count before retrying.
+
+## Image nodes
+
+- Generating from an empty image node writes the first result into that node.
+- A single result replaces the current empty node; multiple results use it as the primary node and add result nodes to the right.
+- A populated image node is reused as a reference image.
+- Generated nodes record the prompt, generation type, model, size, quality, count, and references in `metadata`.
+- A retry stops with a clear warning if required references can no longer be restored.
+
+## Video nodes
+
+Create a video node from the toolbar or upload a local video. Video nodes use the native player. An empty video node can generate into itself, while generation started from text, images, or configuration nodes creates a connected video node.
+
+The OpenAI-compatible flow uses `POST /v1/videos`, `GET /v1/videos/{id}`, and `GET /v1/videos/{id}/content`. For Volcengine Ark Agent Plan and Seedance 2.0, use `https://ark.cn-beijing.volces.com/api/plan/v3` and enter the model name manually because this endpoint does not expose OpenAI's `/models` API.
+
+## Recommended workflow
+
+1. Create a text node with the initial idea.
+2. Ask AI to refine the prompt in the panel below it.
+3. Compare the connected rewritten node with the original.
+4. Select **Generate Image** on the chosen text node.
+5. Adjust parameters or regenerate from the generated configuration node.

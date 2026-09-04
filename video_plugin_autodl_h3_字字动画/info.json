@@ -1,0 +1,9 @@
+{
+  "name": "AutoDL MiniMax-H3 视频生成",
+  "display_name": "AutoDL MiniMax-H3 视频生成",
+  "version": "1.0.0",
+  "description": "通过 AutoDL ComfyUI API 调用 MiniMax-H3 全系列视频工作流：文生视频/首尾帧/多图参考/多图多音频（最长15秒），480p/768p/1080p 多分辨率，参考图自动压缩转 data URI 提交",
+  "author": "autodl-h3",
+  "api_version": 2,
+  "type": "video"
+}

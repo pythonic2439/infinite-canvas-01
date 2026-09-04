@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>AutoDL MiniMax-H3 视频生成</title>
+    <link rel="stylesheet" href="../../../plugin-sdk.css">
+    <style>
+        .api-key-wrapper {
+            position: relative;
+            display: flex;
+            align-items: center;
+        }
+        .api-key-wrapper input {
+            flex: 1;
+            padding-right: 36px;
+        }
+        .toggle-eye {
+            position: absolute;
+            right: 8px;
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            cursor: pointer;
+            font-size: 14px;
+            padding: 2px 4px;
+            line-height: 1;
+        }
+        .toggle-eye:hover {
+            color: var(--text-primary);
+        }
+        .register-row {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            margin-bottom: 4px;
+            font-size: 12px;
+            color: var(--text-muted);
+        }
+        .register-row a {
+            color: #0d7377;
+            text-decoration: none;
+        }
+        .register-row a:hover {
+            text-decoration: underline;
+        }
+        .test-result {
+            margin-top: 6px;
+            font-size: 12px;
+            line-height: 1.6;
+            padding: 6px 10px;
+            border-radius: 4px;
+            display: none;
+        }
+        .test-result.success { background: rgba(76,175,80,0.1); color: #4caf50; display: block; }
+        .test-result.error { background: rgba(255,82,82,0.1); color: #ff5252; display: block; }
+        .hint-text {
+            font-size: 11px;
+            color: var(--text-muted);
+            margin-top: 8px;
+            line-height: 1.7;
+        }
+        .hint-text b { color: var(--text-primary); }
+        .mode-tip {
+            font-size: 11px;
+            color: #0d7377;
+            background: rgba(13, 115, 119, 0.08);
+            border: 1px solid rgba(13, 115, 119, 0.25);
+            border-radius: 4px;
+            padding: 6px 10px;
+            margin-top: 6px;
+            line-height: 1.7;
+        }
+        .inline-row {
+            display: flex;
+            gap: 8px;
+        }
+        .inline-row > * { flex: 1; }
+        .hidden { display: none; }
+    </style>
+</head>
+<body>
+<h3>AutoDL MiniMax-H3 视频生成</h3>
+
+<div class="register-row">
+    <span>令牌获取：autodl.art → 令牌管理（分组选择 ComfyUI）</span>
+    <a href="https://autodl.art/large-model/tokens" target="_blank">打开令牌管理</a>
+</div>
+
+<hr>
+
+<div class="form-row">
+    <label class="form-label">API令牌</label>
+    <div class="form-control">
+        <div class="api-key-wrapper">
+            <input type="password" id="apiKeyInput" placeholder="AutoDL ComfyUI 分组令牌">
+            <button class="toggle-eye" id="toggleEye" type="button">&#128065;</button>
+        </div>
+        <button class="btn-primary" id="testBtn" style="margin-top:6px;">测试连接</button>
+        <div class="test-result" id="testResult"></div>
+    </div>
+</div>
+
+<div class="form-row">
+    <label class="form-label">工作流选择</label>
+    <div class="form-control">
+        <select id="workflowModeSelect">
+            <option value="自动选择">自动选择（推荐）</option>
+            <option value="手动指定">手动指定</option>
+        </select>
+        <div class="mode-tip" id="autoModeTip">
+            自动规则：有参考音频 → 多图多音频工作流；有首帧+尾帧 → 首尾帧工作流；有参考图/首帧 → 多图参考工作流；纯文字 → 文生视频。时长超过10秒自动切换15秒版工作流。
+        </div>
+    </div>
+</div>
+
+<div class="form-row hidden" id="workflowRow">
+    <label class="form-label">指定工作流</label>
+    <div class="form-control">
+        <select id="workflowSelect">
+            <option value="minimax_h3_lightx2v_no_pic">H3文生视频（10秒）</option>
+            <option value="minimax_h3_lightx2v">H3首尾帧生成视频（10秒）</option>
+            <option value="minimax_h3_lightx2v_v5">H3多图参考生视频（10秒，支持1080p）</option>
+            <option value="minimax_h3_lightx2v_v5_15s">H3多图生视频（15秒）</option>
+            <option value="minimax_h3_image_audio_to_video_v2">H3多图多音频生视频（10秒，支持1080p）</option>
+            <option value="minimax_h3_image_audio_to_video_v2_15s">H3多图多音频生视频（15秒）</option>
+        </select>
+        <div class="hint-text">注意：首尾帧工作流需要分镜同时设置首帧和尾帧图；多图参考工作流需要至少1张参考图。</div>
+    </div>
+</div>
+
+<div class="form-row">
+    <label class="form-label">分辨率</label>
+    <div class="form-control">
+        <select id="resolutionSelect">
+            <option value="768p竖">768p竖（默认）</option>
+            <option value="768p横">768p横</option>
+            <option value="480p竖">480p竖</option>
+            <option value="480p横">480p横</option>
+            <option value="1080p竖">1080p竖</option>
+            <option value="1080p横">1080p横</option>
+            <option value="480p(1:1)">480p(1:1)</option>
+            <option value="768p(1:1)">768p(1:1)</option>
+            <option value="1080p(1:1)">1080p(1:1)</option>
+        </select>
+        <div class="hint-text">当前工作流不支持的分辨率会自动降级（如1080p→768p同方向）。480p/768p 促销价￥0.01/秒，1080p按工作流不同约￥0.10/秒。</div>
+    </div>
+</div>
+
+<div class="form-row">
+    <label class="form-label">视频时长</label>
+    <div class="form-control">
+        <div class="inline-row">
+            <select id="durationModeSelect">
+                <option value="跟随分镜">跟随分镜时长</option>
+                <option value="固定值">固定时长</option>
+            </select>
+            <input type="number" id="durationInput" min="1" max="15" value="5">
+        </div>
+        <div class="hint-text">跟随分镜时取分镜的时长设置；固定时长则始终使用右侧数值（1-15秒，超出工作流上限自动截断）。</div>
+    </div>
+</div>
+
+<div class="form-row">
+    <label class="form-label">随机种子</label>
+    <div class="form-control">
+        <input type="text" id="seedInput" placeholder="留空 = 随机（仅多图/音频工作流支持）">
+    </div>
+</div>
+
+<div class="form-row">
+    <label class="form-label">参考图压缩</label>
+    <div class="form-control">
+        <div class="inline-row">
+            <input type="number" id="maxImageSizeInput" min="256" max="2048" value="1024" title="最大边长（像素）">
+            <input type="number" id="imageQualityInput" min="30" max="95" value="88" title="JPEG质量">
+        </div>
+        <div class="hint-text">左：最大边长像素；右：JPEG质量。参考图会自动压缩并转为 data URI 提交，减小请求体积、提升上传成功率。</div>
+    </div>
+</div>
+
+<div class="form-row">
+    <label class="form-label">轮询与超时</label>
+    <div class="form-control">
+        <div class="inline-row">
+            <input type="number" id="pollIntervalInput" min="3" max="60" value="10" title="轮询间隔（秒）">
+            <input type="number" id="timeoutInput" min="60" max="3600" value="900" title="超时（秒）">
+        </div>
+        <div class="hint-text">左：查询间隔秒数；右：单任务最大等待秒数。10秒视频实测约2分钟生成完成。</div>
+    </div>
+</div>
+
+<hr>
+
+<div class="hint-text">
+    <b>使用说明：</b><br>
+    1. 分镜的参考图（最多9张）、首帧/尾帧、参考音频（最多3段）会自动映射到 H3 工作流对应槽位；<br>
+    2. 音频仅支持 MP3/WAV/MP4/FLAC，图片支持 JPG/PNG/WebP（自动转码为JPEG）；<br>
+    3. 计费按视频秒数计算，任务提交后立即开始计费，失败任务不扣费；<br>
+    4. 生成结果为 MP4，自动按分镜规范命名保存到项目目录。
+</div>
+
+<script src="../../../plugin-sdk.js"></script>
+<script>
+(function () {
+    'use strict';
+
+    var _sdkReady = false;
+
+    var apiKeyInput = document.getElementById('apiKeyInput');
+    var toggleEye = document.getElementById('toggleEye');
+    var testBtn = document.getElementById('testBtn');
+    var testResult = document.getElementById('testResult');
+    var workflowModeSelect = document.getElementById('workflowModeSelect');
+    var workflowRow = document.getElementById('workflowRow');
+    var workflowSelect = document.getElementById('workflowSelect');
+    var autoModeTip = document.getElementById('autoModeTip');
+    var resolutionSelect = document.getElementById('resolutionSelect');
+    var durationModeSelect = document.getElementById('durationModeSelect');
+    var durationInput = document.getElementById('durationInput');
+    var seedInput = document.getElementById('seedInput');
+    var maxImageSizeInput = document.getElementById('maxImageSizeInput');
+    var imageQualityInput = document.getElementById('imageQualityInput');
+    var pollIntervalInput = document.getElementById('pollIntervalInput');
+    var timeoutInput = document.getElementById('timeoutInput');
+
+    function save(key, value) {
+        if (_sdkReady && window.PluginSDK) {
+            try { PluginSDK.saveParam(key, value); } catch (e) { console.error(e); }
+        }
+    }
+
+    function updateWorkflowVisibility() {
+        var manual = workflowModeSelect.value === '手动指定';
+        workflowRow.classList.toggle('hidden', !manual);
+        autoModeTip.classList.toggle('hidden', manual);
+    }
+
+    toggleEye.addEventListener('click', function () {
+        apiKeyInput.type = apiKeyInput.type === 'password' ? 'text' : 'password';
+    });
+
+    apiKeyInput.addEventListener('change', function () { save('api_key', apiKeyInput.value.trim()); });
+    workflowModeSelect.addEventListener('change', function () {
+        save('workflow_mode', workflowModeSelect.value);
+        updateWorkflowVisibility();
+    });
+    workflowSelect.addEventListener('change', function () { save('workflow_id', workflowSelect.value); });
+    resolutionSelect.addEventListener('change', function () { save('resolution', resolutionSelect.value); });
+    durationModeSelect.addEventListener('change', function () { save('duration_mode', durationModeSelect.value); });
+    durationInput.addEventListener('change', function () {
+        save('duration', parseInt(durationInput.value) || 5);
+    });
+    seedInput.addEventListener('change', function () { save('seed', seedInput.value.trim()); });
+    maxImageSizeInput.addEventListener('change', function () {
+        save('max_image_size', parseInt(maxImageSizeInput.value) || 1024);
+    });
+    imageQualityInput.addEventListener('change', function () {
+        save('image_quality', parseInt(imageQualityInput.value) || 88);
+    });
+    pollIntervalInput.addEventListener('change', function () {
+        save('poll_interval', parseInt(pollIntervalInput.value) || 10);
+    });
+    timeoutInput.addEventListener('change', function () {
+        save('timeout', parseInt(timeoutInput.value) || 900);
+    });
+
+    testBtn.addEventListener('click', function () {
+        if (!_sdkReady || !window.PluginSDK) {
+            testResult.className = 'test-result error';
+            testResult.textContent = '插件SDK未就绪，请从软件设置面板打开本页面';
+            return;
+        }
+        testResult.className = 'test-result';
+        testResult.textContent = '正在测试…';
+        try {
+            PluginSDK.sendAction('test_connection', {});
+        } catch (e) {
+            testResult.className = 'test-result error';
+            testResult.textContent = '请求失败: ' + e.message;
+        }
+    });
+
+    function applyParams(params) {
+        params = params || {};
+        if (typeof params.api_key === 'string') apiKeyInput.value = params.api_key;
+        if (params.workflow_mode) {
+            workflowModeSelect.value = params.workflow_mode;
+        }
+        if (params.workflow_id) {
+            for (var i = 0; i < workflowSelect.options.length; i++) {
+                if (workflowSelect.options[i].value === params.workflow_id) {
+                    workflowSelect.value = params.workflow_id;
+                    break;
+                }
+            }
+        }
+        if (params.resolution) {
+            for (var j = 0; j < resolutionSelect.options.length; j++) {
+                if (resolutionSelect.options[j].value === params.resolution) {
+                    resolutionSelect.value = params.resolution;
+                    break;
+                }
+            }
+        }
+        if (params.duration_mode) durationModeSelect.value = params.duration_mode;
+        if (params.duration) durationInput.value = params.duration;
+        if (typeof params.seed === 'string') seedInput.value = params.seed;
+        if (params.max_image_size) maxImageSizeInput.value = params.max_image_size;
+        if (params.image_quality) imageQualityInput.value = params.image_quality;
+        if (params.poll_interval) pollIntervalInput.value = params.poll_interval;
+        if (params.timeout) timeoutInput.value = params.timeout;
+        updateWorkflowVisibility();
+    }
+
+    if (window.PluginSDK && typeof PluginSDK.onReady === 'function') {
+        PluginSDK.onReady(function (params) {
+            _sdkReady = true;
+            applyParams(params);
+        });
+        if (typeof PluginSDK.onAction === 'function') {
+            PluginSDK.onAction('test_connection', function (data) {
+                data = data || {};
+                if (data.ok) {
+                    testResult.className = 'test-result success';
+                    testResult.textContent = '✓ ' + (data.message || '令牌有效');
+                } else {
+                    testResult.className = 'test-result error';
+                    testResult.textContent = '✗ ' + (data.error || '测试失败');
+                }
+            });
+        }
+    }
+})();
+</script>
+</body>
+</html>

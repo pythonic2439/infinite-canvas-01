@@ -1,0 +1,27 @@
+.next/
+out/
+node_modules/
+.env*
+!.env.example
+data/
+*.log
+*.tsbuildinfo
+.DS_Store
+.idea
+web/dist
+
+**/dist
+web/public/plugins
+plugins/canvas/*/dist
+plugins/canvas/*/node_modules
+web/public/plugins
+
+# 服务端临时用户数据(参考图, 3 天懒清理)
+ref-images/
+
+# 本地参考副本与个人本地配置
+infinite-canvas_local/
+.claude/
+
+# 含真实密钥/服务器信息的个人文档, 禁止入库
+dola_公网OpenAI_API调用说明.md
