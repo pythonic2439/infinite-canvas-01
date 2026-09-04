@@ -2,96 +2,68 @@
   <img src="web/public/logo.svg" width="96" alt="infinite-canvas logo">
 </p>
 
-<h1 align="center">无限画布 (infinite-canvas)</h1>
+<h1 align="center">无限画布 · 二次开发部署版 (infinite-canvas-01)</h1>
 
 <p align="center">
-  <a href="https://linux.do/"><img src="https://img.shields.io/badge/Linux.do-Community-2b6de8?style=flat-square" alt="Linux.do"></a>
-  <a href="https://render.com/deploy?repo=https://github.com/basketikun/infinite-canvas"><img src="https://img.shields.io/badge/Render-Deploy-46e3b7?style=flat-square&logo=render&logoColor=111111" alt="Deploy to Render"></a>
-  <a href="https://github.com/basketikun/infinite-canvas"><img src="https://img.shields.io/github/stars/basketikun/infinite-canvas?style=flat-square&logo=github" alt="GitHub stars"></a>
-  <a href="https://github.com/basketikun/infinite-canvas/tags"><img src="https://img.shields.io/github/v/tag/basketikun/infinite-canvas?style=flat-square&label=version" alt="Version"></a>
+  <a href="https://ai.01ai.space"><img src="https://img.shields.io/badge/演示站-ai.01ai.space-2b6de8?style=flat-square" alt="Demo"></a>
+  <a href="https://github.com/basketikun/infinite-canvas"><img src="https://img.shields.io/badge/上游-basketikun%2Finfinite--canvas-2b6de8?style=flat-square" alt="Upstream"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-f97316?style=flat-square" alt="License"></a>
   <a href="https://vite.dev/"><img src="https://img.shields.io/badge/Vite-7-646cff?style=flat-square&logo=vite&logoColor=white" alt="Vite"></a>
   <a href="https://reactrouter.com/"><img src="https://img.shields.io/badge/React_Router-7-ca4245?style=flat-square&logo=reactrouter&logoColor=white" alt="React Router"></a>
 </p>
 
 <p align="center">
-<a href="https://trendshift.io/repositories/50077?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-50077" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/50077" alt="basketikun%2Finfinite-canvas | Trendshift" width="250" height="55"/></a>
+  <a href="#--基础功能">基础功能</a> · <a href="#--本分支增强">本分支增强</a> · <a href="#-快速开始">快速开始</a> · <a href="#-效果展示">效果展示</a> · <a href="#-致谢">致谢</a>
 </p>
 
-<p align="center">
-  <a href="docs/content/docs/overview/quick-start.mdx">快速开始</a> · <a href="docs/content/docs/overview/features.mdx">功能介绍</a> · <a href="docs/content/docs/overview/render.mdx">Render 部署</a> · <a href="docs/content/docs/overview/docker.mdx">Docker 部署</a> · <a href="docs/content/docs/canvas/canvas-node-manual.mdx">画布节点操作手册</a> · <a href="docs/content/docs/canvas/canvas-shortcuts.mdx">画布快捷键</a> · <a href="SECURITY.md">漏洞提交</a> · <a href="docs/content/docs/progress/todo.mdx">待办事项</a> · <a href="canvas-agent/README.md">本地 Canvas Agent</a> · <a href="plugins/infinite-canvas">Codex app 插件</a>
-</p>
+基于开源项目 [basketikun/infinite-canvas](https://github.com/basketikun/infinite-canvas) 的二次开发与生产部署版本。
 
-无限画布是一款面向图片创作的开源工作台。它把画布编排、AI 图片生成、参考图编辑、对话助手、提示词库和素材沉淀放在同一个界面里，适合用来探索视觉方案并连续迭代图片结果。
+**在线体验：[https://ai.01ai.space](https://ai.01ai.space)** —— 纯前端应用，打开后在「设置 → 渠道」填入自己的 AI 接口地址与 API Key 即可使用（所有配置保存在浏览器本地，不上传服务器）。
 
-> [!CAUTION]
-> 项目目前处于开发阶段，不保证历史数据兼容。各种本地存储格式都可能直接调整，欢迎关注后续更新。
->
-> 如果你需要稳定维护自己的分支，建议自行 fork 后独立开发。二次开发与 PR 请保留原作者信息和前端页面标识。
+## 基础功能
 
-## 赞助商
+- **无限画布**：多画布项目、节点拖拽缩放、连线编排、小地图、撤销重做、导入导出。
+- **AI 创作**：浏览器直连你配置的 AI 接口，支持文生图、图生图、参考图编辑、文本问答、音频与视频生成。
+- **多渠道协议**：OpenAI / Gemini / 火山方舟(Seedance) / AutoDL ComfyUI / 多米 等格式，支持自定义调用脚本与参数模板。
+- **画布助手**：围绕选中节点与上游内容对话、生图，结果直接插回画布；可接入本机 Codex / Claude Code 作为 Agent。
+- **插件系统**：远程节点插件动态安装/更新，提供 TypeScript SDK 自行开发。
+- **提示词库**：直连多个开源提示词项目并缓存到浏览器。
 
-<table>
-  <tr>
-    <td width="190" align="center">
-      <a href="https://www.atlascloud.ai/zh?utm_source=github&amp;utm_medium=link&amp;utm_campaign=infinite-canvas" target="_blank" rel="noopener noreferrer"><img src="assets/atlascloud.svg" width="163" alt="Atlas Cloud"></a>
-    </td>
-    <td>
-      <a href="https://www.atlascloud.ai/zh?utm_source=github&amp;utm_medium=link&amp;utm_campaign=infinite-canvas" target="_blank" rel="noopener noreferrer">Atlas Cloud</a> is a full-modal AI inference platform that gives developers a single AI API to access video generation, image generation, and LLM APIs. Instead of managing multiple vendor integrations, you connect once and get unified access to 300+ curated models across all modalities. Check out <a href="https://www.atlascloud.ai/console/coding-plan" target="_blank" rel="noopener noreferrer">Atlas Cloud's new coding plan promotion</a> for more budget-friendly API access.
-    </td>
-  </tr>
-  <tr>
-    <td width="190" align="center">
-      <a href="https://infistar.ai/register?aff=4X3V9NA9&amp;ref_source=link" target="_blank" rel="noopener noreferrer"><img src="assets/infistar.png" width="163" alt="Infistar.ai 无限星河"></a>
-    </td>
-    <td>
-      <strong>无限画布 × Infistar.ai 无限星河｜内置原生画布 · 全能多模态 API</strong> 💡 原生集成，即点即用： Infistar.ai 已原生上架无限画布！同时提供低至官方 1 折的稳定 API 中转服务，模型倍率与调用明细全程透明。 🎨 多模态生图/生视频： 完美适配 Seedance、FLUX、Midjourney、Sora、Runway、Luma、可灵（Kling）等顶级图片与视频大模型。 🧠 全系语言模型： 覆盖 OpenAI、Claude、Gemini、Grok、DeepSeek、Qwen、GLM 等国内外主流模型，兼容 OpenAI 标准接口。 ⚡ 动态调度： 多路供应保障高可用，拒绝断连。 🎁 专属福利： 通过 <a href="https://infistar.ai/register?aff=4X3V9NA9&amp;ref_source=link" target="_blank" rel="noopener noreferrer">专属链接</a> 注册，立享赠送额度/专属折扣/首充权益！
-    </td>
-  </tr>
-</table>
+## 本分支增强
 
-## 核心功能
+在上游基础上针对公网部署与豆包系模型做了以下定制：
 
-- 无限画布：多画布项目、节点拖拽缩放、连线、小地图、撤销重做、导入导出。
-- AI 创作：浏览器前台直连你配置的 OpenAI 兼容接口，支持文生图、图生图、参考图编辑、文本问答、音频和视频生成。
-- 画布助手：围绕选中节点和上游节点对话、生图，并把结果插回画布。
-- 本地 Agent：通过本机 Canvas Agent 连接 Codex / Claude Code，让 Agent 通过 MCP 操作当前画布；
-- Codex App 插件：提供 Codex app 插件，安装后会自动注册 MCP 并尝试拉起本地 Agent。
-- 插件系统：支持通过 URL 动态安装 / 启用 / 更新 / 卸载远程节点插件，并提供 TypeScript SDK 自行开发画布节点插件。
-- 自定义接口调用：可自定义生图 / 视频接口的调用方式，灵活适配各类中转站与自建服务。
-- 提示词库：浏览器前端直连多个 GitHub 开源项目，并缓存到 IndexedDB。
-
-完整功能说明见 [功能介绍](docs/content/docs/overview/features.mdx)。
-
-如果你在为担心没有合适的生图API来发愁，可以查看该免费生图项目：[chatgpt2api](https://github.com/basketikun/chatgpt2api)
+- **dola 渠道**：接入「豆包管理器(dola)」公网 API（`dola-image` / `dola-video`），异步任务建单+轮询、参考图自动转公网链接、比例自动收敛到 API 支持的三档（1:1 / 9:16 / 16:9）。
+- **防人脸拦截（Face Guard）**：基于 MediaPipe 离线人脸检测（模型随应用分发，不联网），对视频参考图眼部自动叠加网格/马赛克/斜条干扰；画布图片节点亦提供「眼部网格」手动工具。
+- **生成结果外链本地化**：接口返回临时外链时统一下载、校验并落库到浏览器本地，避免外链过期、防盗链或广告拦截导致图片无法显示；下载失败自动回退原链接。
+- **参考图自动压缩**：超过接口上限的参考图先在本地等比降采样再上传，未超限原样上传不损画质。
+- **失败自动重试**：渠道级重试次数设置，dola 任务因网络抖动失败后自动重新提交。
+- **Nginx 同源反代方案**：`/dola-proxy`、`/duomi-proxy`、`/autodl-proxy` 等同源转发配置范例，解决浏览器直连第三方接口的跨域/混合内容问题（见 `DEPLOY.md`）。
 
 ## 快速开始
-
-AI API Key、Base URL、画布、素材和生成记录默认保存在浏览器本地。
 
 ### 本地开发
 
 ```bash
-git clone git@github.com:basketikun/infinite-canvas.git
-cd infinite-canvas
-cd web
-bun install
-bun run dev
+git clone https://github.com/pythonic2439/infinite-canvas-01.git
+cd infinite-canvas-01/web
+npm install
+npm run dev
 ```
 
 ### Docker 运行
 
 ```bash
-git clone git@github.com:basketikun/infinite-canvas.git
-cd infinite-canvas
+git clone https://github.com/pythonic2439/infinite-canvas-01.git
+cd infinite-canvas-01
 docker compose up -d
 ```
 
-运行后默认端口3000，可访问 `http://localhost:3000`。
+默认端口 3000，访问 `http://localhost:3000`，首次打开在右上角配置中填入 OpenAI 兼容的 `Base URL` 与 `API Key`。
 
-首次打开后进入右上角配置，填入自己的 OpenAI 兼容 `Base URL` 和 `API Key`。
+### 生产部署（静态托管 + Nginx）
 
-如果默认的OpenAI接口调用方式与您的API不同，可自定义生图/视频脚本调用。
+`npm run build` 产物即静态站点，任意静态服务器可托管；参考图转公网链接、接口反代等需要服务端配合的能力见根目录 `DEPLOY.md` 与 `ref-upload.php`。
 
 ## 效果展示
 
@@ -104,44 +76,13 @@ docker compose up -d
     <td width="50%"><img src="https://i.ibb.co/PvY3qhhK/image.png" alt="image" border="0"></td>
     <td width="50%"><img src="https://i.ibb.co/7D04LwN/image.png" alt="image" border="0"></td>
   </tr>
-  <tr>
-    <td width="50%"><img src="https://i.ibb.co/bj30FtS5/5.png" alt="5" border="0"></td>
-    <td width="50%"><img src="https://i.ibb.co/hxRvjw51/image.png" alt="image" border="0"></td>
-  </tr>
-  <tr>
-    <td width="50%"><img src="https://i.ibb.co/jkWsF8q1/image.png" alt="image" border="0"></td>
-    <td width="50%"><img src="https://i.ibb.co/XrnfXHx7/image.png" alt="image" border="0"></td>
-  </tr>
 </table>
 
-## 联系方式
+## 致谢
 
-项目定制二次开发需求 / 生图 API 需求可联系。
-
-邮箱：1844025705@qq.com · QQ：1844025705
-
-## 赞助支持
-
-本项目长期开放广告赞助合作，欢迎品牌 / 产品投放，你的支持是持续更新的动力！
-
-有广告赞助意向请通过上方联系方式沟通。
-
-## 社区支持
-
-学 AI，上 L 站：[LinuxDO](https://linux.do/)
-
-点击链接加入群聊【AI开源交流】：https://qm.qq.com/q/DFnKzZ807u
+- 上游项目：[basketikun/infinite-canvas](https://github.com/basketikun/infinite-canvas) —— 本仓库的全部基础能力均来自该项目，尊重并保留原作者信息。
+- [MediaPipe Tasks Vision](https://developers.google.com/mediapipe) —— 离线人脸检测能力。
 
 ## 开源协议
 
-本项目使用 [MIT License](LICENSE)。任何人都可以免费使用、复制、修改、分发、再授权和商业使用本项目，也可以用于闭源产品。
-
-## Star History
-
-<a href="https://www.star-history.com/?repos=basketikun%2Finfinite-canvas&type=date&legend=top-left">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=basketikun/infinite-canvas&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=basketikun/infinite-canvas&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=basketikun/infinite-canvas&type=date&legend=top-left" />
- </picture>
-</a>
+本项目沿用上游的 [MIT License](LICENSE)，可免费使用、修改、分发与商业使用。
