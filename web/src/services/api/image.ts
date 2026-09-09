@@ -1227,6 +1227,10 @@ export async function fetchImageModels(config: Pick<AiConfig, "baseUrl" | "apiKe
             .filter((id): id is string => Boolean(id))
             .sort((a, b) => a.localeCompare(b));
     } catch (error) {
+        // 拉取模型列表失败且判定为跨域拦截时, 给出可操作的指引: 该站点需要反代或手动填模型名。
+        if (axios.isAxiosError(error) && !error.response && error.code === "ERR_NETWORK" && !isSameOriginRequest(buildApiUrl(config.baseUrl, "/models"))) {
+            throw new Error(apiText("corsProxyHint", { url: config.baseUrl }));
+        }
         throw new Error(readAxiosError(error, apiText("modelReadFailed")));
     }
 }
