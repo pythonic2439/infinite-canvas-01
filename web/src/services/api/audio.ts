@@ -135,7 +135,8 @@ function readApiErrorMessage(value: unknown): string {
 function readAxiosError(error: unknown, fallback: string) {
     if (axios.isCancel(error)) return apiText("requestCanceled");
     if (axios.isAxiosError(error)) {
-        if (!error.response && error.code === "ERR_NETWORK") return apiText("corsRequired");
+        // 同源请求的 ERR_NETWORK 是连接闪断(移动网络/NAT 掐断长连接), 不是跨域; 文案要区分开。
+        if (!error.response && error.code === "ERR_NETWORK") return isSameOriginRequest(error.config?.url) ? apiText("networkDisconnected") : apiText("corsRequired");
         const responseData = error.response?.data;
         const apiMsg = readApiErrorMessage(responseData);
         if (apiMsg) return apiMsg;
@@ -145,6 +146,16 @@ function readAxiosError(error: unknown, fallback: string) {
     }
     if (error instanceof DOMException && error.name === "AbortError") return apiText("requestCanceled");
     return error instanceof Error ? readApiErrorMessage(error.message) || error.message : fallback;
+}
+
+/** 判断出错请求是否发往当前站点: 同源断网/闪断不该报"跨域拦截"。 */
+function isSameOriginRequest(url: string | undefined) {
+    if (!url) return true;
+    try {
+        return new URL(url, window.location.href).origin === window.location.origin;
+    } catch {
+        return true;
+    }
 }
 
 function statusMessage(status: number | undefined, fallback: string) {
