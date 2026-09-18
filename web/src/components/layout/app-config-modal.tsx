@@ -1,6 +1,6 @@
-import { App, Button, Form, Input, Modal, Progress, Select, Tabs } from "antd";
+import { App, Button, Collapse, Form, Input, Modal, Progress, Select, Tabs } from "antd";
 import type { TFunction } from "i18next";
-import { Cloud, Download, Pencil, Plus, RefreshCw, Trash2, Upload, Wifi } from "lucide-react";
+import { CheckCircle2, Cloud, Download, Pencil, Plus, RefreshCw, Trash2, Upload, Wifi } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -13,18 +13,9 @@ import { exportAppConfig, importAppConfig } from "@/services/config-file";
 import { syncAppDataToWebdav, type AppSyncDomainKey, type AppSyncProgressEvent } from "@/services/app-sync";
 import { testWebdavConnection, WEBDAV_MANIFEST_FILE_NAME } from "@/services/webdav-sync";
 import { audioFormatOptions, audioVoiceOptions, normalizeAudioSpeedValue } from "@/lib/audio-generation";
-import {
-    createModelChannel,
-    modelOptionsFromChannels,
-    normalizeModelOptionValue,
-    selectableModelsByCapability,
-    useConfigStore,
-    type AiConfig,
-    type ApiCallFormat,
-    type ConfigTabKey,
-    type ModelCapability,
-    type ModelChannel,
-} from "@/stores/use-config-store";
+import { videoRatioOptions } from "@/lib/seedance-video";
+import { imageRatioOptions } from "@/components/image-settings-panel";
+import { createModelChannel, isServerChannel, modelOptionsFromChannels, normalizeModelOptionValue, selectableModelsByCapability, useConfigStore, type AiConfig, type ApiCallFormat, type ConfigTabKey, type ModelCapability, type ModelChannel } from "@/stores/use-config-store";
 
 type ModelGroup = {
     capability: ModelCapability;
@@ -77,7 +68,10 @@ export function AppConfigPanel({ showDoneButton = false, initialTab = "channels"
     const webdavReady = Boolean(webdav.url.trim());
     const editingChannel = config.channels.find((channel) => channel.id === editingChannelId) || null;
     const locale = i18n.resolvedLanguage as AppLocale;
-    useEffect(() => setActiveTab(initialTab), [initialTab]);
+    // 登录用户: 服务端渠道以「官方模型服务」卡片只读展示, 自带 Key 渠道收进高级折叠; 游客保持完整渠道编辑器。
+    const customChannels = config.channels.filter((channel) => !isServerChannel(channel));
+    const hasServer = config.channels.some(isServerChannel);
+    useEffect(() => setActiveTab(hasServer && ["prompt-sources", "webdav", "local-storage"].includes(initialTab) ? "channels" : initialTab), [hasServer, initialTab]);
 
     const saveConfig = (nextConfig: AiConfig) => {
         (Object.keys(nextConfig) as Array<keyof AiConfig>).forEach((key) => updateConfig(key, nextConfig[key]));
@@ -172,28 +166,104 @@ export function AppConfigPanel({ showDoneButton = false, initialTab = "channels"
         }
     };
 
-    return (
-        <>
-            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-stone-200 pb-3 dark:border-stone-800">
-                <div className="text-xs text-stone-500">{t("config.fileSecurity")}</div>
-                <div className="flex gap-2">
-                    <Button icon={<Upload className="size-4" />} onClick={() => configInputRef.current?.click()}>
-                        {t("config.import")}
-                    </Button>
-                    <Button icon={<Download className="size-4" />} onClick={exportAppConfig}>
-                        {t("config.export")}
-                    </Button>
-                    <input ref={configInputRef} type="file" accept="application/json,.json" className="hidden" onChange={(event) => event.target.files?.[0] && void loadConfigFile(event.target.files[0])} />
+    const channelRow = (channel: ModelChannel) => (
+        <div key={channel.id} className="flex items-center justify-between gap-3 rounded-lg border border-stone-200 px-4 py-3 dark:border-stone-800">
+            <div className="min-w-0">
+                <div className="truncate text-sm font-semibold">{channel.name || t("config.channels.unnamed")}</div>
+                <div className="mt-1 truncate text-xs text-stone-500">
+                    {apiFormatLabel(channel.apiFormat, t)} · {t("config.channels.modelCount", { count: channel.models.length })} · {channel.baseUrl || t("config.channels.missingUrl")}
                 </div>
             </div>
+            <div className="flex shrink-0 gap-2">
+                <Button size="small" icon={<Pencil className="size-3.5" />} onClick={() => setEditingChannelId(channel.id)}>
+                    {t("common.edit")}
+                </Button>
+                <Button size="small" danger icon={<Trash2 className="size-3.5" />} onClick={() => deleteChannel(channel.id)} />
+            </div>
+        </div>
+    );
+
+    const serverModels = config.channels.filter(isServerChannel).flatMap((channel) => channel.models);
+    const capabilityLabel = (capability: ModelCapability) => t(`config.model.capabilities.${capability}`);
+    const serverStatsLine = (["image", "video", "text", "audio"] as ModelCapability[])
+        .map((capability) => ({ capability, count: new Set(serverModels.filter((model) => model.capability === capability).map((model) => model.name)).size }))
+        .filter((item) => item.count > 0)
+        .map((item) => `${capabilityLabel(item.capability)} ${item.count}`)
+        .join(" · ");
+    const serverPriceLine = (["image", "video", "text", "audio"] as ModelCapability[])
+        .map((capability) => {
+            const prices = serverModels.filter((model) => model.capability === capability && (model.points ?? 0) > 0).map((model) => model.points as number);
+            return { capability, min: prices.length ? Math.min(...prices) : 0 };
+        })
+        .filter((item) => item.min > 0)
+        .map((item) => t("config.modelService.pointsFrom", { capability: capabilityLabel(item.capability), count: item.min }))
+        .join(" · ");
+
+    return (
+        <>
+            {/* 登录用户隐藏配置导入导出: 导出文件含 gw_token (身份+点数凭证), 泄露可被盗刷; 游客/BYOK 才需要 */}
+            {!hasServer ? (
+                <div className="flex flex-wrap items-center justify-between gap-3 border-b border-stone-200 pb-3 dark:border-stone-800">
+                    <div className="text-xs text-stone-500">{t("config.fileSecurity")}</div>
+                    <div className="flex gap-2">
+                        <Button icon={<Upload className="size-4" />} onClick={() => configInputRef.current?.click()}>
+                            {t("config.import")}
+                        </Button>
+                        <Button icon={<Download className="size-4" />} onClick={exportAppConfig}>
+                            {t("config.export")}
+                        </Button>
+                        <input ref={configInputRef} type="file" accept="application/json,.json" className="hidden" onChange={(event) => event.target.files?.[0] && void loadConfigFile(event.target.files[0])} />
+                    </div>
+                </div>
+            ) : null}
             <Tabs
                 activeKey={activeTab}
                 onChange={(key) => setActiveTab(key as ConfigTabKey)}
                 items={[
                     {
                         key: "channels",
-                        label: t("config.tabs.channels"),
-                        children: (
+                        label: t(hasServer ? "config.tabs.modelService" : "config.tabs.channels"),
+                        children: hasServer ? (
+                            <div>
+                                <div className="mb-4 rounded-xl border border-stone-200 bg-gradient-to-br from-emerald-50/70 to-transparent p-4 dark:border-stone-800 dark:from-emerald-500/10">
+                                    <div className="flex flex-wrap items-center gap-2">
+                                        <CheckCircle2 className="size-4 text-emerald-600 dark:text-emerald-400" />
+                                        <span className="text-sm font-semibold">{t("config.modelService.title")}</span>
+                                        <span className="rounded-full border border-emerald-300/70 px-2 py-0.5 text-[11px] leading-4 text-emerald-700 dark:border-emerald-500/40 dark:text-emerald-400">{t("config.modelService.badge")}</span>
+                                    </div>
+                                    <div className="mt-2 text-xs leading-5 text-stone-500">{t("config.modelService.summary", { count: new Set(serverModels.map((model) => model.name)).size })}</div>
+                                    {serverStatsLine ? <div className="mt-0.5 text-xs leading-5 text-stone-500">{serverStatsLine}</div> : null}
+                                    {serverPriceLine ? <div className="mt-0.5 text-xs leading-5 text-stone-500">{serverPriceLine}</div> : null}
+                                    <div className="mt-2 text-xs leading-5 text-stone-500">{t("config.modelService.noConfig")}</div>
+                                </div>
+                                <Collapse
+                                    ghost
+                                    size="small"
+                                    items={[
+                                        {
+                                            key: "custom",
+                                            label: (
+                                                <span className="text-sm text-stone-600 dark:text-stone-300">
+                                                    {t("config.channels.advancedSummary")}
+                                                    {customChannels.length ? ` · ${customChannels.length}` : ""}
+                                                </span>
+                                            ),
+                                            children: (
+                                                <div>
+                                                    <div className="mb-3 text-xs text-stone-500">{t("config.channels.advancedHint")}</div>
+                                                    <div className="mb-3 flex justify-end">
+                                                        <Button type="primary" icon={<Plus className="size-4" />} onClick={addChannel}>
+                                                            {t("config.channels.add")}
+                                                        </Button>
+                                                    </div>
+                                                    <div className="space-y-2">{customChannels.map(channelRow)}</div>
+                                                </div>
+                                            ),
+                                        },
+                                    ]}
+                                />
+                            </div>
+                        ) : (
                             <div>
                                 <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
                                     <div className="text-xs text-stone-500">{t("config.channels.description")}</div>
@@ -201,24 +271,7 @@ export function AppConfigPanel({ showDoneButton = false, initialTab = "channels"
                                         {t("config.channels.add")}
                                     </Button>
                                 </div>
-                                <div className="space-y-2">
-                                    {config.channels.map((channel) => (
-                                        <div key={channel.id} className="flex items-center justify-between gap-3 rounded-lg border border-stone-200 px-4 py-3 dark:border-stone-800">
-                                            <div className="min-w-0">
-                                                <div className="truncate text-sm font-semibold">{channel.name || t("config.channels.unnamed")}</div>
-                                                <div className="mt-1 truncate text-xs text-stone-500">
-                                                    {apiFormatLabel(channel.apiFormat, t)} · {t("config.channels.modelCount", { count: channel.models.length })} · {channel.baseUrl || t("config.channels.missingUrl")}
-                                                </div>
-                                            </div>
-                                            <div className="flex shrink-0 gap-2">
-                                                <Button size="small" icon={<Pencil className="size-3.5" />} onClick={() => setEditingChannelId(channel.id)}>
-                                                    {t("common.edit")}
-                                                </Button>
-                                                <Button size="small" danger icon={<Trash2 className="size-3.5" />} onClick={() => deleteChannel(channel.id)} />
-                                            </div>
-                                        </div>
-                                    ))}
-                                </div>
+                                <div className="space-y-2">{config.channels.map(channelRow)}</div>
                             </div>
                         ),
                     },
@@ -247,6 +300,12 @@ export function AppConfigPanel({ showDoneButton = false, initialTab = "channels"
                                             onBlur={(event) => updateConfig("canvasImageCount", normalizeImageCount(event.target.value))}
                                         />
                                     </Form.Item>
+                                    <Form.Item label={t("config.preferences.defaultImageRatio")} extra={t("config.preferences.defaultImageRatioDescription")} className="mb-4">
+                                        <Select value={config.size || "auto"} options={imageRatioOptions} onChange={(value) => updateConfig("size", value)} />
+                                    </Form.Item>
+                                    <Form.Item label={t("config.preferences.defaultVideoRatio")} extra={t("config.preferences.defaultVideoRatioDescription")} className="mb-4">
+                                        <Select value={config.videoRatio || "adaptive"} options={videoRatioOptions} onChange={(value) => updateConfig("videoRatio", value)} />
+                                    </Form.Item>
                                     <Form.Item label={t("config.preferences.audioVoice")} className="mb-4">
                                         <Select value={config.audioVoice} options={audioVoiceOptions} onChange={(value) => updateConfig("audioVoice", value)} />
                                     </Form.Item>
@@ -274,15 +333,14 @@ export function AppConfigPanel({ showDoneButton = false, initialTab = "channels"
                             </Form>
                         ),
                     },
-                    {
-                        key: "prompt-sources",
-                        label: t("config.tabs.promptSources"),
-                        children: <ConfigPromptSources />,
-                    },
-                    {
-                        key: "webdav",
-                        label: "WebDAV",
-                        children: (
+                    ...(hasServer ? [] : [{ key: "prompt-sources", label: t("config.tabs.promptSources"), children: <ConfigPromptSources /> }]),
+                    ...(hasServer
+                        ? []
+                        : [
+                              {
+                                  key: "webdav",
+                                  label: "WebDAV",
+                                  children: (
                             <Form layout="vertical" requiredMark={false}>
                                 <section className="rounded-lg border border-stone-200 p-3 dark:border-stone-800">
                                     <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
@@ -322,12 +380,9 @@ export function AppConfigPanel({ showDoneButton = false, initialTab = "channels"
                                 </section>
                             </Form>
                         ),
-                    },
-                    {
-                        key: "local-storage",
-                        label: t("config.tabs.localStorage"),
-                        children: <ConfigLocalStorage active={activeTab === "local-storage"} />,
-                    },
+                              },
+                          ]),
+                    ...(hasServer ? [] : [{ key: "local-storage", label: t("config.tabs.localStorage"), children: <ConfigLocalStorage active={activeTab === "local-storage"} /> }]),
                 ]}
             />
             {showDoneButton ? (
@@ -400,6 +455,9 @@ function apiFormatLabel(apiFormat: ApiCallFormat, t: TFunction) {
     if (apiFormat === "ark") return t("config.protocols.ark");
     if (apiFormat === "autodl") return t("config.protocols.autodl");
     if (apiFormat === "duomi") return t("config.protocols.duomi");
+    if (apiFormat === "mingze") return t("config.protocols.mingze");
+    if (apiFormat === "doubao") return t("config.protocols.doubao");
+    if (apiFormat === "agnes") return t("config.protocols.agnes");
     if (apiFormat === "dola") return t("config.protocols.dola");
     return "OpenAI";
 }

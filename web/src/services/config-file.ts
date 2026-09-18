@@ -1,7 +1,7 @@
 import { saveAs } from "file-saver";
 
 import i18n from "@/i18n";
-import { useConfigStore, type AiConfig, type WebdavSyncConfig } from "@/stores/use-config-store";
+import { defaultConfig, useConfigStore, type AiConfig, type WebdavSyncConfig } from "@/stores/use-config-store";
 import { usePromptSourceStore, type PromptSourceSchedule } from "@/stores/use-prompt-source-store";
 import type { PromptSource } from "@/services/api/prompt-source-presets";
 
@@ -32,6 +32,7 @@ export async function importAppConfig(file: File) {
         throw new Error(i18n.t("config.invalidFile"));
     }
     if (data.app !== "infinite-canvas" || data.version !== 1 || !data.config || !data.webdav || !data.promptSources) throw new Error(i18n.t("config.invalidFile"));
-    useConfigStore.setState({ config: data.config, webdav: data.webdav });
+    // importAppConfig 直写 state 不走 persist migrate: 旧配置文件缺 videoRatio 时补默认 (读取处另有 || config.size 兜底)
+    useConfigStore.setState({ config: { ...data.config, videoRatio: data.config.videoRatio || defaultConfig.videoRatio }, webdav: data.webdav });
     usePromptSourceStore.setState(data.promptSources);
 }

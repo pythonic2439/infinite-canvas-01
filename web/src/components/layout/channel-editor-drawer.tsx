@@ -3,7 +3,8 @@ import { ListPlus, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 
-import { defaultBaseUrlForApiFormat, guessCapability, normalizeChannelModels, type ApiCallFormat, type ChannelModel, type ModelCapability, type ModelChannel } from "@/stores/use-config-store";
+import { defaultBaseUrlForApiFormat, guessCapability, isServerChannel, normalizeChannelModels, type ApiCallFormat, type ChannelModel, type ModelCapability, type ModelChannel } from "@/stores/use-config-store";
+import { ApiKeyListEditor } from "./api-key-list-editor";
 import { ModelScriptEditor } from "./model-script-editor";
 import { ModelSelectModal } from "./model-select-modal";
 
@@ -55,6 +56,8 @@ function ParamsTemplateEditor({ value, onSave, onCancel }: { value: string; onSa
     );
 }
 
+// Key 列表编辑抽到 api-key-list-editor.tsx, 渠道编辑抽屉 / 管理后台共用。
+
 export function ChannelEditorDrawer({ open, channel, onSave, onClose }: { open: boolean; channel: ModelChannel | null; onSave: (channel: ModelChannel) => void; onClose: () => void }) {
     const { t } = useTranslation();
     const [draft, setDraft] = useState<ModelChannel | null>(channel);
@@ -67,6 +70,9 @@ export function ChannelEditorDrawer({ open, channel, onSave, onClose }: { open: 
         { label: t("config.protocols.ark"), value: "ark" },
         { label: t("config.protocols.autodl"), value: "autodl" },
         { label: t("config.protocols.duomi"), value: "duomi" },
+        { label: t("config.protocols.mingze"), value: "mingze" },
+        { label: t("config.protocols.doubao"), value: "doubao" },
+        { label: t("config.protocols.agnes"), value: "agnes" },
         { label: t("config.protocols.dola"), value: "dola" },
     ];
     const capabilityOptions: Array<{ label: string; value: ModelCapability }> = ["image", "video", "text", "audio"].map((value) => ({ label: t(`config.channelEditor.capabilities.${value}`), value: value as ModelCapability }));
@@ -76,6 +82,30 @@ export function ChannelEditorDrawer({ open, channel, onSave, onClose }: { open: 
     }, [open, channel]);
 
     if (!draft) return null;
+
+    // 官方渠道: 只读概览, 不暴露 Key/URL/协议等配置字段 (由站点统一维护, 编辑按钮不会进来, 此处兜底)。
+    if (isServerChannel(draft)) {
+        return (
+            <Drawer open={open} width={520} title={draft.name || t("config.channelEditor.title")} onClose={onClose} styles={{ body: { paddingTop: 16 } }}>
+                <div className="rounded-lg border border-emerald-200 bg-emerald-50/60 px-3 py-2.5 text-xs leading-5 text-emerald-800 dark:border-emerald-500/30 dark:bg-emerald-500/10 dark:text-emerald-300">
+                    {t("config.modelService.managedHint")}
+                </div>
+                <div className="mt-4 space-y-2">
+                    {draft.models.map((model) => (
+                        <div key={model.name} className="flex items-center justify-between gap-3 rounded-lg border border-stone-200 px-3 py-2 dark:border-stone-800">
+                            <span className="min-w-0 truncate text-sm" title={model.name}>
+                                {model.name}
+                            </span>
+                            <span className="shrink-0 text-xs text-stone-500">
+                                {t(`config.model.capabilities.${model.capability}`)}
+                                {model.points ? ` · ${model.points} ${t("config.modelService.pointsUnit")}` : ""}
+                            </span>
+                        </div>
+                    ))}
+                </div>
+            </Drawer>
+        );
+    }
 
     const patch = (value: Partial<ModelChannel>) => setDraft((current) => (current ? { ...current, ...value } : current));
     const setModels = (models: ChannelModel[]) => patch({ models });
@@ -131,7 +161,7 @@ export function ChannelEditorDrawer({ open, channel, onSave, onClose }: { open: 
                 </label>
                 <label className="block md:col-span-2">
                     <span className="mb-1 block text-sm font-medium">API Key</span>
-                    <Input.Password value={draft.apiKey} onChange={(event) => patch({ apiKey: event.target.value })} placeholder="sk-..." />
+                    <ApiKeyListEditor key={draft.id} value={draft.apiKey} onChange={(apiKey) => patch({ apiKey })} />
                 </label>
                 <div className="flex items-center justify-between rounded-lg border border-stone-200 px-3 py-2.5 md:col-span-2 dark:border-stone-800">
                     <div className="min-w-0 pr-3">

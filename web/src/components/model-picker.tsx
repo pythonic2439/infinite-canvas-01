@@ -5,7 +5,7 @@ import { useTranslation } from "react-i18next";
 import i18n from "@/i18n";
 import { Select, SelectContent, SelectItem, SelectTrigger } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
-import { modelOptionLabel, modelOptionName, selectableModelsByCapability, type AiConfig, type ModelCapability } from "@/stores/use-config-store";
+import { decodeChannelModel, modelOptionLabel, modelOptionName, selectableModelsByCapability, type AiConfig, type ModelCapability } from "@/stores/use-config-store";
 
 type ModelPickerProps = {
     config: AiConfig;
@@ -24,6 +24,9 @@ export function ModelPicker({ config, value, onChange, capability, className, fu
     const [open, setOpen] = useState(false);
     const options = useMemo(() => Array.from(new Set([...(config.channelMode === "local" && !capability ? [value] : []), ...selectableModelsByCapability(config, capability)].filter((model): model is string => Boolean(model)))), [capability, config, value]);
     const current = value || "";
+    // 选中值不在可选项里 (渠道被停用/模型被管理员下架/旧缓存): 显示"已下架"标记, 不再伪装成正常选项
+    const isStale = Boolean(current) && !options.includes(current);
+    const currentLabel = current ? `${modelOptionLabel(config, current)}${isStale ? `（${t("settingsPanels.model.unavailable")}）` : ""}` : "";
     const pickerPlaceholder = placeholder || t("settingsPanels.model.select");
 
     useEffect(() => {
@@ -54,10 +57,10 @@ export function ModelPicker({ config, value, onChange, capability, className, fu
                 )}
                 onMouseDown={(event) => event.stopPropagation()}
                 onPointerDown={(event) => event.stopPropagation()}
-                title={current ? modelOptionLabel(config, current) : pickerPlaceholder}
+                title={currentLabel || pickerPlaceholder}
             >
                 <ModelIcon model={current} />
-                <span className="canvas-model-picker-text min-w-0 flex-1 truncate text-left">{current ? modelOptionLabel(config, current) : pickerPlaceholder}</span>
+                <span className={cn("canvas-model-picker-text min-w-0 flex-1 truncate text-left", isStale && "text-stone-400")}>{currentLabel || pickerPlaceholder}</span>
             </SelectTrigger>
             <SelectContent
                 data-canvas-no-zoom
@@ -92,12 +95,21 @@ function emptyModelLabel(config: AiConfig, capability?: ModelCapability) {
 }
 
 function ModelLabel({ config, model }: { config: AiConfig; model: string }) {
+    const points = resolveModelPoints(config, model);
     return (
         <span className="flex min-w-0 items-center gap-2">
             <ModelIcon model={model} />
             <span className="truncate">{modelOptionLabel(config, model)}</span>
+            {points ? <span className="ml-auto shrink-0 pl-2 text-[11px] tabular-nums text-stone-400">{i18n.t("settingsPanels.model.pointsPerRun", { count: points })}</span> : null}
         </span>
     );
+}
+
+/** 服务端渠道模型显示每次生成的点数消耗。 */
+function resolveModelPoints(config: AiConfig, model: string) {
+    const decoded = decodeChannelModel(model);
+    const channel = decoded ? config.channels.find((item) => item.id === decoded.channelId) : undefined;
+    return channel?.models.find((item) => item.name === (decoded?.model || model))?.points || 0;
 }
 
 function ModelIcon({ model }: { model: string }) {
