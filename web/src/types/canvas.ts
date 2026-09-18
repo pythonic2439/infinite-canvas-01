@@ -30,11 +30,18 @@ export type CanvasNodeImage = {
     status: CanvasNodeStatus;
     errorDetails?: string;
     content: string;
-    storageKey: string;
+    storageKey?: string;
     naturalWidth: number;
     naturalHeight: number;
     bytes: number;
     mimeType: string;
+};
+
+export type CanvasNodeText = {
+    id: string;
+    status: CanvasNodeStatus;
+    errorDetails?: string;
+    content: string;
 };
 
 export type CanvasNodeMetadata = {
@@ -47,11 +54,17 @@ export type CanvasNodeMetadata = {
     generationMode?: CanvasGenerationMode;
     generationType?: CanvasImageGenerationType;
     model?: string;
+    models?: string[];
     reasoningEffort?: "auto" | "low" | "medium" | "high" | "xhigh";
     size?: string;
+    /** 节点级生视频默认画幅 (画布侧一般不写, 保留以备扩展; 请求端以 metadata.size 优先)。 */
+    videoRatio?: string;
     quality?: string;
     background?: string;
     count?: number;
+    textCount?: number;
+    texts?: CanvasNodeText[];
+    primaryTextId?: string;
     seconds?: string;
     vquality?: string;
     generateAudio?: string;
@@ -70,6 +83,10 @@ export type CanvasNodeMetadata = {
     mimeType?: string;
     bytes?: number;
     durationMs?: number;
+    /** 远端视频任务 ID: 刷新/换设备后可凭此恢复轮询 (见 project.tsx pollVideoNodeTask)。 */
+    videoTaskId?: string;
+    videoTaskProvider?: string;
+    videoTaskModel?: string;
     groupId?: string;
     interactive?: boolean; // Plugin node interaction/move state; see CanvasNodeDefinition.interactionToggle.
 };

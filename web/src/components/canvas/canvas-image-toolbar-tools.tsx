@@ -1,11 +1,11 @@
 import type { ReactNode } from "react";
-import { Brush, Camera, Copy, FileText, Grid2x2, Lock, LockOpen, Maximize2, Scissors, ScanFace, Sparkles, Upload, ZoomIn } from "lucide-react";
+import { Brush, Camera, Copy, FileText, Grid2x2, Lock, LockOpen, Maximize2, ScanFace, Scissors, SlidersHorizontal, Sparkles, Upload, ZoomIn } from "lucide-react";
 
 import type { CanvasNodeData } from "@/types/canvas";
 import i18n from "@/i18n";
 
-export type ImageNodeActionToolId = "copyPrompt" | "reversePrompt" | "replace" | "resize" | "maskEdit" | "faceGuard" | "crop" | "split" | "upscale" | "superResolve" | "angle" | "view";
-export type ImageQuickToolId = "info" | "delete" | "saveAsset" | "download" | "edit" | ImageNodeActionToolId;
+export type ImageNodeActionToolId = "reuseParams" | "copyPrompt" | "reversePrompt" | "replace" | "resize" | "maskEdit" | "faceGuard" | "crop" | "split" | "upscale" | "angle" | "view";
+export type ImageQuickToolId = "info" | "delete" | "saveAsset" | "download" | ImageNodeActionToolId;
 
 export type ImageToolHandlers = {
     onUpload: (node: CanvasNodeData) => void;
@@ -15,11 +15,11 @@ export type ImageToolHandlers = {
     onCrop: (node: CanvasNodeData) => void;
     onSplit: (node: CanvasNodeData) => void;
     onUpscale: (node: CanvasNodeData) => void;
-    onSuperResolve: (node: CanvasNodeData) => void;
     onAngle: (node: CanvasNodeData) => void;
     onViewImage: (node: CanvasNodeData) => void;
     onCopyPrompt: (node: CanvasNodeData) => void;
     onReversePrompt: (node: CanvasNodeData) => void;
+    onReuseParams: (node: CanvasNodeData) => void;
 };
 
 export type ImageToolDefinition = {
@@ -37,11 +37,19 @@ export type ImageQuickToolsConfig = {
     showLabels: boolean;
 };
 
-export const IMAGE_QUICK_TOOLS_STORAGE_KEY = "canvas-image-quick-tools-v6";
+export const IMAGE_QUICK_TOOLS_STORAGE_KEY = "canvas-image-quick-tools-v8";
 
-const defaultBaseToolIds: ImageQuickToolId[] = ["info", "delete", "saveAsset", "download", "edit"];
+const defaultBaseToolIds: ImageQuickToolId[] = ["info", "delete", "saveAsset", "download"];
 
 export const imageToolDefinitions: ImageToolDefinition[] = [
+    {
+        id: "reuseParams",
+        defaultVisible: true,
+        label: () => i18n.t("canvas.imageTools.reuseParams"),
+        title: () => i18n.t("canvas.imageTools.reuseParamsTitle"),
+        icon: () => <SlidersHorizontal className="size-4" />,
+        run: (node, handlers) => handlers.onReuseParams(node),
+    },
     {
         id: "copyPrompt",
         defaultVisible: true,
@@ -116,14 +124,6 @@ export const imageToolDefinitions: ImageToolDefinition[] = [
         run: (node, handlers) => handlers.onUpscale(node),
     },
     {
-        id: "superResolve",
-        defaultVisible: false,
-        label: () => i18n.t("canvas.imageTools.superResolve"),
-        title: () => i18n.t("canvas.imageTools.superResolveTitle"),
-        icon: () => <Sparkles className="size-4" />,
-        run: (node, handlers) => handlers.onSuperResolve(node),
-    },
-    {
         id: "angle",
         defaultVisible: false,
         label: () => i18n.t("canvas.imageTools.angle"),
@@ -161,12 +161,12 @@ export function normalizeImageQuickToolIds(value: unknown[]) {
 }
 
 export function readImageQuickToolsConfig(value: unknown): ImageQuickToolsConfig {
-    if (Array.isArray(value)) return { ids: normalizeImageQuickToolIds(value), showLabels: true };
-    if (!value || typeof value !== "object") return { ids: defaultImageQuickToolIds, showLabels: true };
+    if (Array.isArray(value)) return { ids: normalizeImageQuickToolIds(value), showLabels: false };
+    if (!value || typeof value !== "object") return { ids: defaultImageQuickToolIds, showLabels: false };
     const data = value as Partial<ImageQuickToolsConfig>;
     return {
         ids: Array.isArray(data.ids) ? normalizeImageQuickToolIds(data.ids) : defaultImageQuickToolIds,
-        showLabels: data.showLabels !== false,
+        showLabels: data.showLabels === true,
     };
 }
 

@@ -2,18 +2,21 @@ import axios from "axios";
 import { nanoid } from "nanoid";
 
 import i18n from "@/i18n";
-import { guardReferenceImages } from "@/lib/face-guard";
 import { dataUrlToFile } from "@/lib/image-utils";
-import { compressDolaReference, uploadReferenceImage } from "@/services/api/image";
+import { guardReferenceImages } from "@/lib/face-guard";
+import { boolConfig, buildSeedancePromptText, isSeedanceVideoConfig, normalizeSeedanceDuration, normalizeSeedanceRatio, normalizeSeedanceResolution, resolveVideoRatio, seedanceVideoReferenceError, SEEDANCE_REFERENCE_LIMITS } from "@/lib/seedance-video";
 import { getMediaBlob, uploadMediaFile, type UploadedFile } from "@/services/file-storage";
 import { imageToDataUrl } from "@/services/image-storage";
-import { boolConfig, buildSeedancePromptText, isSeedanceVideoConfig, normalizeSeedanceDuration, normalizeSeedanceRatio, normalizeSeedanceResolution, seedanceVideoReferenceError, SEEDANCE_REFERENCE_LIMITS } from "@/lib/seedance-video";
+import { channelKey, noteRateLimit, retryWithKeyRotation } from "./key-pool";
+import { requireLogin } from "@/stores/use-auth-store";
+import { uploadReferenceImageUrl, compressDolaReference } from "./image";
+import { maybeRefundGeneration } from "./site";
 import { buildApiUrl, modelOptionName, resolveModelParams, resolveModelRequestConfig, resolveModelScript, type AiConfig } from "@/stores/use-config-store";
 import { runModelPlugin } from "./model-plugin";
 import type { ReferenceImage } from "@/types/image";
 import type { ReferenceAudio, ReferenceVideo } from "@/types/media";
 
-type VideoResponse = { id: string; status?: string; error?: { message?: string }; url?: string; result_url?: string; video_url?: string; content?: { video_url?: string; url?: string } | null };
+type VideoResponse = { id: string; video_id?: string; status?: string; error?: { message?: string } | string; url?: string; result_url?: string; video_url?: string; no_watermark_url?: string; download_url?: string; content?: { video_url?: string; url?: string } | null };
 type ApiVideoResponse = VideoResponse | { code?: number | string; data?: VideoResponse | null; msg?: string; message?: string; error?: { message?: string } };
 type SeedanceTask = {
     id: string;
@@ -31,7 +34,7 @@ type RequestOptions = { signal?: AbortSignal };
 const apiText = (key: string, options?: Record<string, unknown>) => i18n.t(`apiErrors.${key}`, options);
 
 export type VideoGenerationResult = { blob?: Blob; url?: string; mimeType?: string };
-export type VideoGenerationTask = { id: string; provider: "openai" | "seedance" | "autodl" | "plugin" | "dola"; model: string };
+export type VideoGenerationTask = { id: string; provider: "openai" | "seedance" | "autodl" | "plugin" | "mingze" | "doubao" | "agnes" | "dola"; model: string };
 export type VideoGenerationTaskState = { status: "pending" } | { status: "completed"; result: VideoGenerationResult } | { status: "failed"; error: string };
 
 /** Results for scripted (plugin) video models, which run their own create+poll in one shot at task creation. */
@@ -43,66 +46,117 @@ function aiApiUrl(config: AiConfig, path: string) {
 
 function aiHeaders(config: AiConfig, contentType?: string) {
     return {
-        Authorization: `Bearer ${config.apiKey}`,
+        Authorization: `Bearer ${channelKey(config)}`,
+        ...(contentType ? { "Content-Type": contentType } : {}),
+    };
+}
+
+// 豆包管理器桥接服务用 X-Bridge-Token 头鉴权 (token 填在渠道 API Key), 不走 Bearer。
+function doubaoHeaders(config: AiConfig, contentType?: string) {
+    return {
+        "X-Bridge-Token": channelKey(config),
         ...(contentType ? { "Content-Type": contentType } : {}),
     };
 }
 
 export async function requestVideoGeneration(config: AiConfig, prompt: string, references: ReferenceImage[] = [], videoReferences: ReferenceVideo[] = [], audioReferences: ReferenceAudio[] = [], options?: RequestOptions): Promise<VideoGenerationResult> {
+    // 商业站点无游客模式: 未登录弹出登录框并中断
+    if (!requireLogin()) throw new Error(apiText("loginRequired"));
     // dola 渠道失败自动重试: 隧道抖动导致的任务中断(参考图拉取失败等)重提常可成功, 次数由渠道设置控制。
     const requestConfig = resolveModelRequestConfig(config, (config.model || config.videoModel).trim());
     const retries = requestConfig.apiFormat === "dola" ? Math.max(0, Math.min(5, Math.floor(Number(requestConfig.retryLimit) || 0))) : 0;
-    for (let attempt = 0; ; attempt += 1) {
+    for (let retry = 0; ; retry += 1) {
         try {
             const task = await createVideoGenerationTask(config, prompt, references, videoReferences, audioReferences, options);
-            return await pollVideoGenerationUntilDone(config, task, options);
+            try {
+                return await pollVideoGenerationUntilDone(config, task, options);
+            } catch (error) {
+                // 任务已提交扣费后的失败 (轮询失败/超时): 服务端渠道自动退点
+                maybeRefundGeneration(config, task.model, error);
+                throw error;
+            }
         } catch (error) {
-            if (attempt >= retries || options?.signal?.aborted || (error instanceof DOMException && error.name === "AbortError")) throw error;
+            if (retry >= retries || options?.signal?.aborted || (error instanceof DOMException && error.name === "AbortError")) throw error;
             await delay(3000, options?.signal);
         }
     }
 }
 
+/** 已建任务后仅轮询至完成: 画布节点凭 videoTaskId 恢复等待时复用 (刷新/换设备后继续等出片)。 */
+export async function waitForVideoGenerationTask(config: AiConfig, task: VideoGenerationTask, options?: RequestOptions): Promise<VideoGenerationResult> {
+    return pollVideoGenerationUntilDone(config, task, options);
+}
+
+/** 任务被上游判定失败 (区别于网络/轮询中断): 失败的任务无法恢复, 节点应清掉 videoTaskId。 */
+export function isVideoTaskFailed(error: unknown) {
+    return error instanceof Error && error.name === "VideoTaskFailed";
+}
+
+function videoTaskFailed(message: string) {
+    const error = new Error(message);
+    error.name = "VideoTaskFailed";
+    return error;
+}
+
 async function pollVideoGenerationUntilDone(config: AiConfig, task: VideoGenerationTask, options?: RequestOptions): Promise<VideoGenerationResult> {
-    const delayMs = task.provider === "seedance" || task.provider === "autodl" || task.provider === "dola" ? 5000 : 2500;
-    // AutoDL H3 tasks can sit in the queue and render for ~20 minutes.
-    const maxAttempts = task.provider === "autodl" ? 240 : 120;
+    // Dola video jobs commonly take several minutes after submission. The
+    // local relay keeps the task alive for its configured 30-minute timeout,
+    // so the client must not stop polling after the generic 5-minute window.
+    const localDola = isLocalDolaApi(config, task.model);
+    // 所有视频渠道统一允许最长约 30 分钟(1800s)的排队/渲染等待。
+    // 5s 间隔渠道需 360 次, 2.5s 间隔渠道需 720 次。
+    const maxAttempts = task.provider === "seedance" || task.provider === "autodl" || task.provider === "mingze" || task.provider === "doubao" || task.provider === "agnes" || task.provider === "dola" || localDola ? 360 : 720;
+    const pollDelayMs = task.provider === "seedance" || task.provider === "autodl" || task.provider === "mingze" || task.provider === "doubao" || task.provider === "agnes" || task.provider === "dola" || localDola ? 5000 : 2500;
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
         if (options?.signal?.aborted) throw new DOMException("Aborted", "AbortError");
         const state = await pollVideoGenerationTask(config, task, options);
         if (state.status === "completed") return state.result;
-        if (state.status === "failed") throw new Error(state.error);
+        if (state.status === "failed") throw videoTaskFailed(state.error);
         if (attempt === maxAttempts - 1) throw new Error(apiText("videoTimeout", { provider: task.provider === "seedance" ? "Seedance " : task.provider === "autodl" ? "AutoDL " : "" }));
-        await delay(delayMs, options?.signal);
+        await delay(pollDelayMs, options?.signal);
     }
     throw new Error(apiText("videoTimeout", { provider: "" }));
 }
 
-export async function createVideoGenerationTask(config: AiConfig, prompt: string, originalReferences: ReferenceImage[] = [], videoReferences: ReferenceVideo[] = [], audioReferences: ReferenceAudio[] = [], options?: RequestOptions): Promise<VideoGenerationTask> {
+export async function createVideoGenerationTask(config: AiConfig, prompt: string, references: ReferenceImage[] = [], videoReferences: ReferenceVideo[] = [], audioReferences: ReferenceAudio[] = [], options?: RequestOptions): Promise<VideoGenerationTask> {
+    return retryWithKeyRotation(config, () => createVideoGenerationTaskOnce(config, prompt, references, videoReferences, audioReferences, options));
+}
+
+async function createVideoGenerationTaskOnce(config: AiConfig, prompt: string, references: ReferenceImage[] = [], videoReferences: ReferenceVideo[] = [], audioReferences: ReferenceAudio[] = [], options?: RequestOptions): Promise<VideoGenerationTask> {
     const selectedModel = (config.model || config.videoModel).trim();
     const requestConfig = resolveModelRequestConfig(config, selectedModel);
-    // 防人脸拦截: 渠道开启时先给视频参考图眼部叠加干扰(仅视频, 图片生图不拦截), 再走各协议分支。
-    const references = await guardReferenceImages(requestConfig, originalReferences);
+    // 防人脸拦截: 渠道开启时先给参考图眼部叠加干扰, 再走各协议分支。
+    const guardedReferences = await guardReferenceImages(requestConfig, references);
     const script = resolveModelScript(config, selectedModel);
-    if (script) return createPluginVideoTask(requestConfig, selectedModel, script, prompt, references, options);
+    if (script) return createPluginVideoTask(requestConfig, selectedModel, script, prompt, guardedReferences, options);
     assertVideoConfig(requestConfig, requestConfig.model);
     if (isSeedanceVideoConfig(requestConfig)) {
-        return createSeedanceTask(requestConfig, selectedModel, prompt, references, videoReferences, audioReferences, options);
+        return createSeedanceTask(requestConfig, selectedModel, prompt, guardedReferences, videoReferences, audioReferences, options);
     }
     if (requestConfig.apiFormat === "autodl") {
         // requestConfig.model is the bare workflow id (channel prefix stripped).
-        return createAutoDlVideoTask(requestConfig, requestConfig.model, prompt, references, videoReferences, audioReferences, options);
+        return createAutoDlVideoTask(requestConfig, requestConfig.model, prompt, guardedReferences, videoReferences, audioReferences, options);
     }
     if (videoReferences.length || audioReferences.length) {
         throw new Error(apiText("videoReferencesUnsupported"));
     }
-    if (requestConfig.apiFormat === "dola") {
-        return createDolaVideoTask(requestConfig, selectedModel, prompt, references, options);
+    if (requestConfig.apiFormat === "mingze") {
+        return createMingzeVideoTask(requestConfig, selectedModel, prompt, guardedReferences, options);
     }
-    return createOpenAIVideoTask(requestConfig, selectedModel, prompt, references, options);
+    if (requestConfig.apiFormat === "agnes") {
+        return createAgnesVideoTask(requestConfig, selectedModel, prompt, guardedReferences, options);
+    }
+    if (requestConfig.apiFormat === "dola") {
+        return createDolaVideoTask(requestConfig, selectedModel, prompt, guardedReferences, options);
+    }
+    return createOpenAIVideoTask(requestConfig, selectedModel, prompt, guardedReferences, options);
 }
 
 export async function pollVideoGenerationTask(config: AiConfig, task: VideoGenerationTask, options?: RequestOptions): Promise<VideoGenerationTaskState> {
+    return retryWithKeyRotation(config, () => pollVideoGenerationTaskOnce(config, task, options));
+}
+
+async function pollVideoGenerationTaskOnce(config: AiConfig, task: VideoGenerationTask, options?: RequestOptions): Promise<VideoGenerationTaskState> {
     if (task.provider === "plugin") {
         const result = pluginVideoResults.get(task.id);
         return result ? { status: "completed", result } : { status: "failed", error: apiText("pluginVideoExpired") };
@@ -111,6 +165,9 @@ export async function pollVideoGenerationTask(config: AiConfig, task: VideoGener
     assertVideoConfig(requestConfig, requestConfig.model);
     if (task.provider === "seedance") return pollSeedanceTask(requestConfig, task, options);
     if (task.provider === "autodl") return pollAutoDlVideoTask(requestConfig, task, options);
+    if (task.provider === "mingze") return pollMingzeVideoTask(requestConfig, task, options);
+    if (task.provider === "doubao") return pollDoubaoVideoTask(requestConfig, task, options);
+    if (task.provider === "agnes") return pollAgnesVideoTask(requestConfig, task, options);
     if (task.provider === "dola") return pollDolaVideoTask(requestConfig, task, options);
     return pollOpenAIVideoTask(requestConfig, task, options);
 }
@@ -167,6 +224,7 @@ export async function storeGeneratedVideo(result: VideoGenerationResult): Promis
 }
 
 async function createOpenAIVideoTask(config: AiConfig, model: string, prompt: string, references: ReferenceImage[], options?: RequestOptions): Promise<VideoGenerationTask> {
+    if (isLocalDolaApi(config, model)) return createLocalDolaVideoTask(config, model, prompt, references, options);
     const body = new FormData();
     body.append("model", modelOptionName(model));
     body.append("prompt", prompt);
@@ -185,17 +243,321 @@ async function createOpenAIVideoTask(config: AiConfig, model: string, prompt: st
     }
 }
 
+async function createLocalDolaVideoTask(config: AiConfig, model: string, prompt: string, references: ReferenceImage[], options?: RequestOptions): Promise<VideoGenerationTask> {
+    const duration = Number(config.videoSeconds) >= 30 ? 30 : 15;
+    const ratio = localDolaVideoRatio(config.size);
+    // Canvas references are often local object URLs or IndexedDB storage keys;
+    // convert them to data URLs so the local relay can materialize and upload
+    // them through its native Dola reference pipeline.
+    const imageUrls = (await Promise.all(references.slice(0, 10).map((image) => imageToDataUrl(image, options)))).filter(Boolean);
+    try {
+        const response = await axios.post<ApiVideoResponse>(aiApiUrl(config, "/videos/generations"), {
+            model: modelOptionName(model),
+            prompt,
+            duration,
+            ratio,
+            image_urls: imageUrls,
+        }, { headers: { ...aiHeaders(config), "Content-Type": "application/json" }, signal: options?.signal });
+        const created = unwrapVideoResponse(response.data);
+        if (!created.id) throw new Error(apiText("noVideoTaskId"));
+        return { id: created.id, provider: "openai", model };
+    } catch (error) {
+        throw new Error(readAxiosError(error, apiText("videoTaskCreateFailed")));
+    }
+}
+
 async function pollOpenAIVideoTask(config: AiConfig, task: VideoGenerationTask, options?: RequestOptions): Promise<VideoGenerationTaskState> {
     try {
-        const video = unwrapVideoResponse((await axios.get<ApiVideoResponse>(aiApiUrl(config, `/videos/${task.id}`), { headers: aiHeaders(config), signal: options?.signal })).data);
-        const url = videoResultUrl(video);
-        if (url) return { status: "completed", result: await videoResultFromUrl(url, options) };
-        if (video.status === "completed") {
-            const content = await axios.get<Blob>(aiApiUrl(config, `/videos/${task.id}/content`), { headers: aiHeaders(config), responseType: "blob", signal: options?.signal });
+        const path = isLocalDolaApi(config, task.model) ? `/videos/tasks/${encodeURIComponent(task.id)}` : `/videos/${encodeURIComponent(task.id)}`;
+        const video = unwrapVideoResponse((await axios.get<ApiVideoResponse>(aiApiUrl(config, path), { headers: aiHeaders(config), signal: options?.signal })).data);
+        const localApi = isLocalDolaApi(config, task.model);
+        const url = videoResultUrl(video, localApi);
+        if (url) return { status: "completed", result: await videoResultFromUrl(url, options, localApi ? config : undefined) };
+        if (["completed", "succeeded", "success", "done"].includes(String(video.status || "").toLowerCase())) {
+            const content = await axios.get<Blob>(localApi ? aiApiUrl(config, `/videos/tasks/${encodeURIComponent(task.id)}/download`) : aiApiUrl(config, `/videos/${task.id}/content`), { headers: aiHeaders(config), responseType: "blob", signal: options?.signal });
             await assertVideoBlob(content.data);
             return { status: "completed", result: { blob: content.data } };
         }
-        if (video.status === "failed" || video.status === "cancelled") return { status: "failed", error: readApiErrorMessage(video.error?.message) || apiText("videoGenerationFailed") };
+        if (["failed", "cancelled", "canceled", "error"].includes(String(video.status || "").toLowerCase())) return { status: "failed", error: readApiErrorMessage(video.error) || apiText("videoGenerationFailed") };
+        return { status: "pending" };
+    } catch (error) {
+        throw new Error(readAxiosError(error, apiText("videoTaskQueryFailed")));
+    }
+}
+
+async function videoResultFromUrl(url: string, options?: RequestOptions, config?: AiConfig): Promise<VideoGenerationResult> {
+    try {
+        const response = await axios.get<Blob>(url, { responseType: "blob", headers: config ? aiHeaders(config) : undefined, signal: options?.signal });
+        await assertVideoBlob(response.data);
+        return { blob: response.data };
+    } catch (error) {
+        if (axios.isCancel(error) || options?.signal?.aborted) throw error;
+        if (config) throw new Error(readAxiosError(error, apiText("videoDownloadFailed")));
+        return { url, mimeType: "video/mp4" };
+    }
+}
+
+// 鸣泽影坊本地视频自动化: 创建任务 -> 轮询 /jobs/{id} -> 完成时取 /jobs/{id}/result。
+// 参考图与本地 Dola 视频同源，转成 data URL 后经 image_urls 传入做图生视频。
+async function createMingzeVideoTask(config: AiConfig, model: string, prompt: string, references: ReferenceImage[], options?: RequestOptions): Promise<VideoGenerationTask> {
+    const imageUrls = (await Promise.all(references.slice(0, 10).map((image) => imageToDataUrl(image, options)))).filter(Boolean);
+    try {
+        const created = unwrapVideoResponse(
+            (
+                await axios.post<ApiVideoResponse>(
+                    aiApiUrl(config, "/videos"),
+                    {
+                        model: modelOptionName(model),
+                        prompt,
+                        seconds: normalizeVideoSeconds(config.videoSeconds),
+                        ...(imageUrls.length ? { image_urls: imageUrls } : {}),
+                    },
+                    { headers: aiHeaders(config, "application/json"), signal: options?.signal },
+                )
+            ).data,
+        ) as unknown as VideoResponse & { job_id?: string };
+        const jobId = created.job_id || created.id;
+        if (!jobId) throw new Error(apiText("noVideoTaskId"));
+        return { id: jobId, provider: "mingze", model };
+    } catch (error) {
+        throw new Error(readAxiosError(error, apiText("videoTaskCreateFailed")));
+    }
+}
+
+async function pollMingzeVideoTask(config: AiConfig, task: VideoGenerationTask, options?: RequestOptions): Promise<VideoGenerationTaskState> {
+    try {
+        const state = unwrapVideoResponse(
+            (await axios.get<ApiVideoResponse>(aiApiUrl(config, `/jobs/${encodeURIComponent(task.id)}`), { headers: aiHeaders(config), signal: options?.signal })).data,
+        ) as unknown as VideoResponse & { resources?: unknown[]; error_message?: string; error?: unknown };
+        const url = mingzeResultFromArray(state.resources) || mingzeResultUrl(state) || videoResultUrl(state);
+        if (url) return { status: "completed", result: await videoResultFromUrl(url, options) };
+        const status = String(state.status || "").toLowerCase();
+        if (["completed", "finished", "succeeded", "done", "success"].includes(status)) {
+            return mingzeResultFromJob(config, task.id, options);
+        }
+        if (["failed", "error", "cancelled", "canceled"].includes(status)) {
+            const message = typeof state.error_message === "string" && state.error_message ? state.error_message : readApiErrorMessage(state.error);
+            return { status: "failed", error: message || apiText("videoGenerationFailed") };
+        }
+        return { status: "pending" };
+    } catch (error) {
+        throw new Error(readAxiosError(error, apiText("videoTaskQueryFailed")));
+    }
+}
+
+async function mingzeResultFromJob(config: AiConfig, jobId: string, options?: RequestOptions): Promise<VideoGenerationTaskState> {
+    try {
+        const response = await axios.get<Blob>(aiApiUrl(config, `/jobs/${encodeURIComponent(jobId)}/result`), { headers: aiHeaders(config), responseType: "blob", signal: options?.signal });
+        const blob = response.data;
+        if (!blob.type.includes("json") && !blob.type.includes("text")) {
+            await assertVideoBlob(blob);
+            return { status: "completed", result: { blob } };
+        }
+        const raw = await blob.text();
+        let payload: unknown = raw;
+        try {
+            payload = JSON.parse(raw);
+        } catch {
+            // plain-text result, may still be an error message
+        }
+        if (payload && typeof payload === "object") {
+            const apiError = readApiErrorMessage(payload as Record<string, unknown>);
+            if (apiError) throw new Error(apiError);
+        }
+        const url = mingzeResultUrl(payload);
+        if (!url) return { status: "failed", error: apiText("mingzeNoResult") };
+        return { status: "completed", result: await videoResultFromUrl(url, options) };
+    } catch (error) {
+        throw new Error(readAxiosError(error, apiText("videoDownloadFailed")));
+    }
+}
+
+// Result payloads may nest the actual video object under {data}; unwrap it and reuse the shared URL-field reader.
+function mingzeResultUrl(payload: unknown): string {
+    if (typeof payload === "string") return videoResultUrl({ url: payload }) || "";
+    if (!payload || typeof payload !== "object") return "";
+    const record = payload as Record<string, unknown>;
+    if (record.data && typeof record.data === "object") {
+        const nested = mingzeResultUrl(record.data);
+        if (nested) return nested;
+    }
+    return videoResultUrl(record as VideoResponse) || "";
+}
+
+// Job responses carry finished resources in an array; scan each entry for a playable video URL.
+function mingzeResultFromArray(resources: unknown): string {
+    if (!Array.isArray(resources)) return "";
+    for (const item of resources) {
+        const url = mingzeResultUrl(item);
+        if (url) return url;
+    }
+    return "";
+}
+
+// 豆包管理器桥接服务 (v1 REST 契约, 见 doubao_bridge_capture/API.md):
+// POST /v1/video/generations 创建任务, GET /v1/video/generations/{id} 轮询, 成功取 result.video_url。
+// 目标平台 doubao(seedance2.0fast/mini, ≤15s) 与 dola(额外支持 dreamina-seedance2.5, ≤30s) 按模型+时长自动选择。
+const DOUBAO_DURATIONS: Record<"doubao" | "dola", number[]> = { doubao: [5, 10, 15], dola: [5, 10, 15, 30] };
+
+function doubaoTargetPlatform(model: string, duration: number): "doubao" | "dola" {
+    return model === "dreamina-seedance2.5" || duration > 15 ? "dola" : "doubao";
+}
+
+function doubaoDuration(value: number, target: "doubao" | "dola"): number {
+    const options = DOUBAO_DURATIONS[target];
+    const duration = Number.isFinite(value) && value > 0 ? value : 10;
+    return options.reduce((closest, option) => (Math.abs(option - duration) < Math.abs(closest - duration) ? option : closest));
+}
+
+async function createDoubaoVideoTask(config: AiConfig, model: string, prompt: string, references: ReferenceImage[], options?: RequestOptions): Promise<VideoGenerationTask> {
+    // 桥接只接收本地文件路径作为参考图 (image_paths)，画布引用无法直接注入，暂不支持图生视频。
+    if (references.length) throw new Error(apiText("doubaoReferencesUnsupported"));
+    const rawModel = modelOptionName(model);
+    const requested = Number(config.videoSeconds) || 10;
+    const target = doubaoTargetPlatform(rawModel, requested);
+    const duration = doubaoDuration(requested, target);
+    const ratio = localDolaVideoRatio(config.size);
+    try {
+        const created = unwrapVideoResponse(
+            (
+                await axios.post<ApiVideoResponse>(
+                    aiApiUrl(config, "/v1/video/generations"),
+                    {
+                        prompt,
+                        image_paths: [],
+                        duration,
+                        ratio,
+                        model: rawModel,
+                        target_platform: target,
+                        remove_watermark: true,
+                    },
+                    { headers: doubaoHeaders(config, "application/json"), signal: options?.signal },
+                )
+            ).data,
+        );
+        if (!created.id) throw new Error(apiText("noVideoTaskId"));
+        return { id: created.id, provider: "doubao", model };
+    } catch (error) {
+        throw new Error(readAxiosError(error, apiText("videoTaskCreateFailed")));
+    }
+}
+
+type DoubaoTaskState = ApiVideoResponse & { status?: string; stage?: string; result?: { video_url?: string; file_path?: string }; error?: { message?: string } | null };
+async function pollDoubaoVideoTask(config: AiConfig, task: VideoGenerationTask, options?: RequestOptions): Promise<VideoGenerationTaskState> {
+    try {
+        const state = unwrapVideoResponse(
+            (await axios.get<ApiVideoResponse>(aiApiUrl(config, `/v1/video/generations/${encodeURIComponent(task.id)}`), { headers: doubaoHeaders(config), signal: options?.signal })).data,
+        ) as DoubaoTaskState;
+        const status = String(state.status || "").toLowerCase();
+        const url = state.result?.video_url || state.result?.file_path || videoResultUrl(state);
+        if (status === "succeeded") {
+            if (url) return { status: "completed", result: await videoResultFromUrl(url, options) };
+            return { status: "failed", error: apiText("doubaoNoResult") };
+        }
+        if (["failed", "error", "cancelled", "canceled"].includes(status)) {
+            return { status: "failed", error: readApiErrorMessage(state.error) || apiText("videoGenerationFailed") };
+        }
+        return { status: "pending" };
+    } catch (error) {
+        throw new Error(readAxiosError(error, apiText("videoTaskQueryFailed")));
+    }
+}
+
+// Agnes AI 视频异步任务: POST /v1/videos 创建 (JSON)，轮询 GET /agnesapi?video_id=...&model_name=...，成功后取 metadata.url。
+// 两套请求体按模型区分：v2.0 用 num_frames/frame_rate 控制时长（≤441 且 8n+1，固定 24fps）；
+// 2.5 系列为 OpenAI Videos 兼容格式，用字符串 seconds（4–12）+ size/aspect_ratio，禁止传 width/height/num_frames 等字段。
+// 参考图都要求公网 URL，本地引用先传图床转链接（与多米参考图同一通道）。
+const AGNES_VIDEO_FRAME_RATE = 24;
+const AGNES_VIDEO_RATIOS = ["21:9", "16:9", "4:3", "1:1", "3:4", "9:16"];
+
+// 画布"秒数"折算为 24fps 帧数，取整到 8n+1 并夹在 [25, 441]（约 1~18 秒）。
+function agnesVideoFrames(seconds: string) {
+    return Math.min(441, Math.max(25, Math.round((Math.max(1, Math.min(18, Math.floor(Number(seconds) || 5))) * AGNES_VIDEO_FRAME_RATE) / 8) * 8 + 1));
+}
+
+const isAgnesVideo25 = (model: string) => model.includes("2.5");
+
+// 2.5 系列时长为字符串形式，夹在 4–12 秒。
+function agnesVideoSeconds(seconds: string) {
+    return String(Math.min(12, Math.max(4, Math.round(Number(seconds) || 5))));
+}
+
+// 2.5 系列分辨率档位：flash 仅支持 720P；正式版按清晰度映射 720P/960P/2K。
+function agnesVideoSize(model: string, vquality: string) {
+    if (model.includes("flash")) return "720P";
+    const height = Number(normalizeVideoResolution(vquality).replace("p", "")) || 720;
+    return height >= 1080 ? "2K" : height > 720 ? "960P" : "720P";
+}
+
+// 画布比例归一到 2.5 系列支持的 6 种画幅（不支持 auto 与白名单外的值）。
+function agnesVideoRatio(size: string) {
+    const value = size.trim();
+    if (AGNES_VIDEO_RATIOS.includes(value)) return value;
+    const [width, height] = value.split(/[x:]/).map(Number);
+    const target = width > 0 && height > 0 ? width / height : 16 / 9;
+    return AGNES_VIDEO_RATIOS.reduce((best, item) => {
+        const [w, h] = item.split(":").map(Number);
+        const [bw, bh] = best.split(":").map(Number);
+        return Math.abs(w / h - target) < Math.abs(bw / bh - target) ? item : best;
+    });
+}
+
+async function createAgnesVideoTask(config: AiConfig, model: string, prompt: string, references: ReferenceImage[], options?: RequestOptions): Promise<VideoGenerationTask> {
+    const modelName = modelOptionName(model);
+    // 2.5 系列 reference 模式最多 5 张参考图；v2.0 图生视频只收单张 image。
+    const images = await Promise.all(
+        references.slice(0, isAgnesVideo25(modelName) ? 5 : 1).map(async (image) => {
+            if (/^https?:\/\//i.test(image.dataUrl)) return image.dataUrl;
+            try {
+                return await uploadReferenceImageUrl(image, options?.signal);
+            } catch (error) {
+                if (axios.isCancel(error) || (error instanceof DOMException && error.name === "AbortError")) throw error;
+                throw new Error(apiText("duomiReferenceUploadFailed", { message: error instanceof Error ? error.message : String(error) }));
+            }
+        }),
+    );
+    const body = isAgnesVideo25(modelName)
+        ? {
+              model: modelName,
+              prompt,
+              seconds: agnesVideoSeconds(config.videoSeconds),
+              mode: images.length ? "reference" : "text",
+              size: agnesVideoSize(modelName, config.vquality),
+              aspect_ratio: agnesVideoRatio(config.size),
+              ...(images.length ? { images } : {}),
+          }
+        : {
+              model: modelName,
+              prompt,
+              ...(images.length ? { image: images[0] } : {}),
+              num_frames: agnesVideoFrames(config.videoSeconds),
+              frame_rate: AGNES_VIDEO_FRAME_RATE,
+          };
+    try {
+        const created = unwrapVideoResponse(
+            (await axios.post<ApiVideoResponse>(aiApiUrl(config, "/videos"), body, { headers: aiHeaders(config, "application/json"), signal: options?.signal })).data,
+        );
+        if (!created.id) throw new Error(apiText("noVideoTaskId"));
+        // 官方推荐用 video_id 查询任务（可能与 task_id 不同），缺省时回退任务 id。
+        return { id: created.video_id || created.id, provider: "agnes", model: modelName };
+    } catch (error) {
+        throw new Error(readAxiosError(error, apiText("videoTaskCreateFailed")));
+    }
+}
+
+async function pollAgnesVideoTask(config: AiConfig, task: VideoGenerationTask, options?: RequestOptions): Promise<VideoGenerationTaskState> {
+    try {
+        // 查询统一走 /agnesapi（官方推荐，两种模型通用）；keyframe/reference 模式必须带 model_name。
+        const query = new URLSearchParams({ video_id: task.id, model_name: task.model });
+        const state = unwrapVideoResponse(
+            (await axios.get<ApiVideoResponse>(`${config.baseUrl.replace(/\/v1\/?$/, "")}/agnesapi?${query.toString()}`, { headers: aiHeaders(config), signal: options?.signal })).data,
+        ) as unknown as VideoResponse & { metadata?: { url?: string } };
+        // Agnes 把成片地址放在 metadata.url，不在通用结果字段列表里，需要单独读取。
+        const url = state.metadata?.url || videoResultUrl(state);
+        if (url) return { status: "completed", result: await videoResultFromUrl(url, options) };
+        const status = String(state.status || "").toLowerCase();
+        if (["completed", "succeeded", "success", "done"].includes(status)) return { status: "failed", error: apiText("agnesNoResult") };
+        if (["failed", "error", "cancelled", "canceled"].includes(status)) return { status: "failed", error: readApiErrorMessage(state.error) || apiText("videoGenerationFailed") };
         return { status: "pending" };
     } catch (error) {
         throw new Error(readAxiosError(error, apiText("videoTaskQueryFailed")));
@@ -213,7 +575,7 @@ async function createSeedanceTask(config: AiConfig, model: string, prompt: strin
     const payload = {
         model: modelOptionName(model),
         content,
-        ratio: normalizeSeedanceRatio(config.size),
+        ratio: normalizeSeedanceRatio(resolveVideoRatio(config)),
         resolution: normalizeSeedanceResolution(config.vquality),
         duration: normalizeSeedanceDuration(config.videoSeconds),
         generate_audio: boolConfig(config.videoGenerateAudio, true),
@@ -269,7 +631,7 @@ async function createDolaVideoTask(config: AiConfig, model: string, prompt: stri
     const images = await Promise.all(
         references.slice(0, 7).map(async (image) => {
             if (/^https?:\/\//i.test(image.dataUrl)) return image.dataUrl;
-            return uploadReferenceImage({ ...image, dataUrl: await compressDolaReference(image) }, options?.signal);
+            return uploadReferenceImageUrl({ ...image, dataUrl: await compressDolaReference(image) }, options?.signal);
         }),
     );
     if (!prompt.trim() && !images.length) throw new Error(apiText("videoPromptRequired"));
@@ -494,7 +856,7 @@ function autoDlApiUrl(config: AiConfig, path: string) {
 
 // AutoDL expects the raw token in Authorization, without a Bearer prefix; strip one if pasted that way.
 function autoDlHeaders(config: AiConfig, contentType?: string) {
-    const token = config.apiKey.trim().replace(/^Bearer\s+/i, "");
+    const token = channelKey(config).trim().replace(/^Bearer\s+/i, "");
     return {
         Authorization: token,
         ...(contentType ? { "Content-Type": contentType } : {}),
@@ -646,15 +1008,13 @@ async function resolveSeedanceAudioUrl(audio: ReferenceAudio) {
     return blobToDataUrl(blob);
 }
 
-async function videoResultFromUrl(url: string, options?: RequestOptions): Promise<VideoGenerationResult> {
-    try {
-        const response = await axios.get<Blob>(url, { responseType: "blob", signal: options?.signal });
-        await assertVideoBlob(response.data);
-        return { blob: response.data };
-    } catch (error) {
-        if (axios.isCancel(error) || options?.signal?.aborted) throw error;
-        return { url, mimeType: "video/mp4" };
-    }
+function blobToDataUrl(blob: Blob) {
+    return new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || ""));
+        reader.onerror = () => reject(new Error(apiText("localAssetReadFailed")));
+        reader.readAsDataURL(blob);
+    });
 }
 
 function assertVideoConfig(config: AiConfig, model: string) {
@@ -665,8 +1025,8 @@ function assertVideoConfig(config: AiConfig, model: string) {
 }
 
 function normalizeVideoSeconds(value: string) {
-    const seconds = Math.floor(Number(value) || 5);
-    return String(Math.max(1, Math.min(15, seconds)));
+    const seconds = Math.floor(Number(value) || 6);
+    return String(Math.max(1, Math.min(20, seconds)));
 }
 
 function normalizeVideoSize(value: string) {
@@ -701,8 +1061,24 @@ function unwrapEnvelope<T>(payload: ApiEnvelope<T>, emptyMessage: string): T {
     return payload as T;
 }
 
-function videoResultUrl(payload: VideoResponse | SeedanceTask) {
-    return [payload.video_url, payload.result_url, payload.url, payload.content?.video_url, payload.content?.url].find((url) => typeof url === "string" && (isPublicMediaUrl(url) || /\.mp4(\?|#|$)/i.test(url)));
+function videoResultUrl(payload: VideoResponse | SeedanceTask | DoubaoTaskState | Record<string, unknown>, allowLocalDownload = false) {
+    const video = payload as VideoResponse;
+    const candidates = allowLocalDownload
+        ? [video.download_url, video.no_watermark_url, video.video_url, video.result_url, video.url, video.content?.video_url, video.content?.url]
+        : [video.no_watermark_url, video.video_url, video.result_url, video.url, video.content?.video_url, video.content?.url];
+    return candidates.find((url) => typeof url === "string" && (isPublicMediaUrl(url) || /\.mp4(\?|#|$)/i.test(url) || (allowLocalDownload && /^https?:\/\/(?:127\.0\.0\.1|localhost):8088\/v1\/videos\/tasks\/[^/]+\/download\/?$/i.test(url))));
+}
+
+function isLocalDolaApi(config: AiConfig, model: string) {
+    return modelOptionName(model).toLowerCase() === "dola-video" || config.baseUrl.includes("127.0.0.1:8088") || config.baseUrl.includes("localhost:8088");
+}
+
+function localDolaVideoRatio(value: string) {
+    const normalized = String(value || "").trim();
+    if (["9:16", "2:3", "3:4"].includes(normalized)) return "9:16";
+    const match = normalized.match(/^(\d+)x(\d+)$/);
+    if (match && Number(match[2]) > Number(match[1])) return "9:16";
+    return "16:9";
 }
 
 function readApiErrorMessage(value: unknown): string {
@@ -721,17 +1097,27 @@ function readApiErrorMessage(value: unknown): string {
     if (typeof value !== "object") return "";
     const payload = value as { msg?: unknown; message?: unknown; error?: unknown; detail?: unknown };
     // error may be a string or an object containing a message.
-    const errorMsg = typeof payload.error === "string" ? payload.error : (payload.error as { message?: unknown })?.message;
-    return readApiErrorMessage(payload.msg) || readApiErrorMessage(payload.message) || readApiErrorMessage(errorMsg) || readApiErrorMessage(payload.detail) || "";
+    const errorMsg =
+        typeof payload.error === "string"
+            ? payload.error
+            : (payload.error as { message?: unknown })?.message;
+    return (
+        readApiErrorMessage(payload.msg) ||
+        readApiErrorMessage(payload.message) ||
+        readApiErrorMessage(errorMsg) ||
+        readApiErrorMessage(payload.detail) ||
+        ""
+    );
 }
 
 function readAxiosError(error: unknown, fallback: string) {
+    noteRateLimit(error);
     if (axios.isCancel(error)) return apiText("requestCanceled");
     if (axios.isAxiosError<{ error?: { message?: string }; msg?: string; message?: string; code?: number | string }>(error)) {
         // 同源请求的 ERR_NETWORK 是连接闪断(移动网络/NAT 掐断长连接), 不是跨域; 文案要区分开。
         if (!error.response && error.code === "ERR_NETWORK") return isSameOriginRequest(error.config?.url) ? apiText("networkDisconnected") : apiText("corsRequired");
         const responseData = error.response?.data;
-        return readApiErrorMessage(responseData) || statusMessage(error.response?.status, fallback) || networkErrorMessage(error, fallback);
+        return readApiErrorMessage(responseData) || statusMessage(error.response?.status, fallback);
     }
     if (error instanceof DOMException && error.name === "AbortError") return apiText("requestCanceled");
     return error instanceof Error ? readApiErrorMessage(error.message) || error.message : fallback;
@@ -750,13 +1136,7 @@ function isSameOriginRequest(url: string | undefined) {
 function statusMessage(status: number | undefined, fallback: string) {
     if (status === 401 || status === 403) return apiText("authenticationFailed");
     if (status === 429) return apiText("rateLimited");
-    return status ? `${fallback}（${status}）` : "";
-}
-
-// No HTTP response at all (DNS failure, connection refused/cut off, CORS block) — surface the axios code so it is diagnosable.
-function networkErrorMessage(error: { code?: string; message?: string }, fallback: string) {
-    const code = error.code || "";
-    return code ? `${fallback}（${code}）` : fallback;
+    return status ? `${fallback}（${status}）` : fallback;
 }
 
 async function assertVideoBlob(blob: Blob) {
@@ -790,14 +1170,5 @@ function delay(ms: number, signal?: AbortSignal) {
             },
             { once: true },
         );
-    });
-}
-
-function blobToDataUrl(blob: Blob) {
-    return new Promise<string>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(String(reader.result || ""));
-        reader.onerror = () => reject(new Error(apiText("localAssetReadFailed")));
-        reader.readAsDataURL(blob);
     });
 }

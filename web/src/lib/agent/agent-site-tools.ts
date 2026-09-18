@@ -4,7 +4,7 @@ import i18n from "@/i18n";
 import { fetchPrompts } from "@/services/api/prompts";
 import { uploadImage } from "@/services/image-storage";
 import { imageAspectOptions, imageQualityOptions } from "@/components/image-settings-panel";
-import { videoResolutionOptions, videoSecondOptions, videoSizeOptions } from "@/components/video-settings-panel";
+import { isLocalDolaVideo, videoResolutionOptions, videoSecondOptions, videoSizeOptions } from "@/components/video-settings-panel";
 import type { CanvasAgentSnapshot } from "@/lib/canvas/canvas-agent-ops";
 import { useCanvasStore } from "@/stores/canvas/use-canvas-store";
 import { useAssetStore } from "@/stores/use-asset-store";
@@ -193,14 +193,14 @@ function getVideoConfig() {
             model,
             modelName: modelOptionName(model),
             size: config.size || "1280x720",
-            seconds: config.videoSeconds || "5",
+            seconds: config.videoSeconds || "6",
             resolution: config.vquality || "720",
             generateAudio: config.videoGenerateAudio !== "false",
             watermark: config.videoWatermark === "true",
         },
         models: selectableModelsByCapability(config, "video").map((value) => ({ value, label: modelOptionLabel(config, value) })),
         sizeOptions: videoSizeOptions,
-        secondsOptions: videoSecondOptions,
+        secondsOptions: isLocalDolaVideo(config) ? ["15", "30"] : videoSecondOptions,
         resolutionOptions: videoResolutionOptions,
     };
 }

@@ -1,10 +1,10 @@
-import { type ReactNode, useState } from "react";
-import { ConfigProvider, Switch } from "antd";
+import { type ReactNode, useEffect, useState } from "react";
+import { Checkbox, ConfigProvider, Switch } from "antd";
 import { useTranslation } from "react-i18next";
 
 import i18n from "@/i18n";
 import { type CanvasTheme } from "@/lib/canvas-theme";
-import type { AiConfig } from "@/stores/use-config-store";
+import { isDolaImageModel, modelOptionLabel, selectableModelsByCapability, type AiConfig } from "@/stores/use-config-store";
 
 const qualityOptions = [
     { value: "auto", labelKey: "auto" },
@@ -32,6 +32,8 @@ const aspectOptions = [
 
 export const imageQualityOptions = qualityOptions.map((item) => ({ value: item.value, get label() { return i18n.t(`settingsPanels.common.${item.labelKey}`); } }));
 export const imageAspectOptions = aspectOptions.map((item) => ({ value: item.size || item.value, label: item.label }));
+/** 偏好设置"默认生图比例"选项: 去掉 2k/4k 尺寸项, 即 auto/1:1/3:2/2:3/4:3/3:4/16:9/9:16。 */
+export const imageRatioOptions = aspectOptions.filter((item) => !item.size).map((item) => ({ value: item.value, label: item.label }));
 
 type ImageSettingsPanelProps = {
     config: AiConfig;
@@ -41,22 +43,30 @@ type ImageSettingsPanelProps = {
     className?: string;
     maxCount?: number;
     quickCount?: number;
-    /** dola-image 只支持三档比例: 仅显示 1:1 / 16:9 / 9:16 与 auto。 */
-    dolaAspect?: boolean;
+    compareModels?: string[];
+    onCompareModelsChange?: (models: string[]) => void;
+    /** dola 比例收敛判定的模型取值, 工作台等页面选中模型与 config.model 不同时传入。 */
+    dolaModelValue?: string;
 };
 
-const DOLA_ASPECT_VALUES = ["1:1", "16:9", "9:16", "auto"];
-
-export function ImageSettingsPanel({ config, onConfigChange, theme, showTitle = true, className = "w-[320px] space-y-4 rounded-2xl px-1 py-0.5", maxCount = 15, quickCount = 10, dolaAspect = false }: ImageSettingsPanelProps) {
+export function ImageSettingsPanel({ config, onConfigChange, theme, showTitle = true, className = "w-[320px] space-y-4 rounded-2xl px-1 py-0.5", maxCount = 15, quickCount = 10, compareModels, onCompareModelsChange, dolaModelValue }: ImageSettingsPanelProps) {
     const { t } = useTranslation();
     const [snapDimensionToStep, setSnapDimensionToStep] = useState(true);
     const quality = config.quality || "auto";
     const count = Math.max(1, Math.min(maxCount, Math.floor(Math.abs(Number(config.count)) || 1)));
     const activeSize = config.size || "auto";
     const transparentBackground = config.background === "transparent";
-    const selectedAspect = aspectOptions.find((item) => (item.size || item.value) === activeSize || item.value === activeSize);
-    const dimensions = readSizeDimensions(activeSize, selectedAspect || aspectOptions[0]);
-    const aspectChoices = dolaAspect ? aspectOptions.filter((item) => DOLA_ASPECT_VALUES.includes(item.value)) : aspectOptions;
+    const dolaAspect = isDolaImageModel(config, dolaModelValue);
+    const availableAspectOptions = dolaAspect ? aspectOptions.filter((item) => ["1:1", "9:16", "16:9", "auto"].includes(item.value)) : aspectOptions;
+    const selectedAspect = availableAspectOptions.find((item) => (item.size || item.value) === activeSize || item.value === activeSize);
+    const dimensions = readSizeDimensions(activeSize, selectedAspect || availableAspectOptions[0]);
+    const compareModelOptions = onCompareModelsChange ? selectableModelsByCapability(config, "image").filter((model) => model !== config.model) : [];
+
+    useEffect(() => {
+        if (!dolaAspect) return;
+        const supported = availableAspectOptions.some((item) => (item.size || item.value) === activeSize || item.value === activeSize);
+        if (!supported) onConfigChange("size", "1:1");
+    }, [activeSize, availableAspectOptions, dolaAspect, onConfigChange]);
     const selectAspect = (value: string) => {
         const option = aspectOptions.find((item) => item.value === value);
         onConfigChange("size", option?.size || option?.value || "auto");
@@ -111,7 +121,7 @@ export function ImageSettingsPanel({ config, onConfigChange, theme, showTitle = 
                 <div className="space-y-2.5">
                     <SettingTitle color={theme.node.muted}>{t("settingsPanels.image.aspectRatio")}</SettingTitle>
                     <div className="grid grid-cols-4 gap-2.5">
-                        {aspectChoices.map((item) => (
+                        {availableAspectOptions.map((item) => (
                             <button
                                 key={item.value}
                                 type="button"
@@ -148,6 +158,28 @@ export function ImageSettingsPanel({ config, onConfigChange, theme, showTitle = 
                         <CountInput value={count} max={maxCount} theme={theme} onChange={(value) => onConfigChange("count", String(value || 1))} />
                     </div>
                 </div>
+                {onCompareModelsChange ? (
+                    <div className="space-y-2.5">
+                        <SettingTitle color={theme.node.muted}>{t("settingsPanels.image.compareModels")}</SettingTitle>
+                        {compareModelOptions.length ? (
+                            <div className="thin-scrollbar max-h-44 overflow-y-auto" onMouseDown={(event) => event.stopPropagation()}>
+                                <Checkbox.Group
+                                    className="grid grid-cols-1 gap-1.5"
+                                    value={compareModels || []}
+                                    onChange={(values) => onCompareModelsChange(values as string[])}
+                                    options={compareModelOptions.map((model) => ({ label: modelOptionLabel(config, model), value: model }))}
+                                />
+                            </div>
+                        ) : (
+                            <div className="text-xs" style={{ color: theme.node.muted }}>
+                                {t("settingsPanels.image.noCompareModels")}
+                            </div>
+                        )}
+                        <div className="text-xs" style={{ color: theme.node.muted, opacity: 0.75 }}>
+                            {t("settingsPanels.image.compareModelsHint")}
+                        </div>
+                    </div>
+                ) : null}
             </div>
         </ImageSettingsTheme>
     );

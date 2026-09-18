@@ -1,12 +1,13 @@
-import { type ReactNode } from "react";
+import { type ReactNode, useEffect, useRef, useState } from "react";
 import { Switch } from "antd";
 import { useTranslation } from "react-i18next";
 
 import i18n from "@/i18n";
 import { ImageSettingsTheme } from "@/components/image-settings-panel";
-import { boolConfig, isSeedanceVideoConfig, normalizeSeedanceDuration, normalizeSeedanceRatio, normalizeSeedanceResolution, seedanceDurationOptions, seedancePixelLabel, seedanceRatioOptions, seedanceResolutionOptions } from "@/lib/seedance-video";
+import { fetchDoubaoStatus, renewDoubao, type DoubaoRenewResult, type DoubaoStatus } from "@/services/api/doubao";
+import { boolConfig, isSeedanceVideoConfig, normalizeSeedanceDuration, normalizeSeedanceRatio, normalizeSeedanceResolution, resolveVideoRatio, seedanceDurationOptions, seedancePixelLabel, seedanceRatioLabelKeys, seedanceRatioOptions, seedanceResolutionOptions } from "@/lib/seedance-video";
 import { type CanvasTheme } from "@/lib/canvas-theme";
-import { type AiConfig } from "@/stores/use-config-store";
+import { type AiConfig, useConfigStore } from "@/stores/use-config-store";
 
 const resolutionOptions = [
     { value: "720", label: "720p" },
@@ -22,8 +23,7 @@ const sizeOptions = [
     { value: "auto", labelKey: "auto", width: 0, height: 0 },
 ];
 
-const secondOptions = [5, 10, 15];
-const seedanceRatioLabelKeys: Record<string, string> = { "16:9": "landscape", "9:16": "portrait", "1:1": "square", "4:3": "standardLandscape", "3:4": "standardPortrait", "21:9": "cinematic", adaptive: "adaptive" };
+const secondOptions = [6, 10, 12, 16, 20];
 
 export const videoResolutionOptions = resolutionOptions.map((item) => ({ value: item.value, label: item.label }));
 export const videoSizeOptions = sizeOptions.map((item) => ({ value: item.value, get label() { return i18n.t(`settingsPanels.video.sizes.${item.labelKey}`); } }));
@@ -43,7 +43,14 @@ export function VideoSettingsPanel({ config, onConfigChange, theme, showTitle = 
         return <SeedanceVideoSettingsPanel config={config} onConfigChange={onConfigChange} theme={theme} showTitle={showTitle} className={className} />;
     }
 
-    const seconds = config.videoSeconds || "5";
+    const doubao = isDoubaoVideo(config);
+    const localDola = isLocalDolaVideo(config);
+    const seconds = doubao
+        ? (Number(config.videoSeconds) >= 30 ? "30" : config.videoSeconds || "10")
+        : localDola
+          ? (Number(config.videoSeconds) >= 30 ? "30" : "15")
+          : config.videoSeconds || "6";
+    const supportedSecondOptions = doubao ? [5, 10, 15, 30] : localDola ? [15, 30] : secondOptions;
     const size = normalizeVideoSizeValue(config.size);
     const dimensions = readSizeDimensions(size);
     const resolution = normalizeVideoResolutionValue(config.vquality);
@@ -95,23 +102,169 @@ export function VideoSettingsPanel({ config, onConfigChange, theme, showTitle = 
                 </SettingGroup>
                 <SettingGroup title={t("settingsPanels.video.seconds")} color={theme.node.muted}>
                     <div className="grid grid-cols-3 gap-2.5">
-                        {secondOptions.map((value) => (
+                        {supportedSecondOptions.map((value) => (
                             <OptionPill key={value} selected={seconds === String(value)} theme={theme} onClick={() => onConfigChange("videoSeconds", String(value))}>
                                 {value}s
                             </OptionPill>
                         ))}
-                        <NumberInput value={seconds} min={1} max={15} theme={theme} onChange={(value) => onConfigChange("videoSeconds", value)} />
+                        {doubao ? <NumberInput value={seconds} min={1} max={30} theme={theme} onChange={(value) => onConfigChange("videoSeconds", value)} /> : localDola ? null : <NumberInput value={seconds} min={1} max={20} theme={theme} onChange={(value) => onConfigChange("videoSeconds", value)} />}
                     </div>
                 </SettingGroup>
+                {doubao ? <DoubaoBridgeStatus config={config} theme={theme} /> : null}
             </div>
         </ImageSettingsTheme>
+    );
+}
+
+function syncDoubaoToken(token?: string) {
+    if (!token) return;
+    const store = useConfigStore.getState();
+    let changed = false;
+    const channels = store.config.channels.map((channel) => {
+        if ((channel.id === "doubao" || channel.apiFormat === "doubao") && channel.apiKey !== token) {
+            changed = true;
+            return { ...channel, apiKey: token };
+        }
+        return channel;
+    });
+    if (changed) store.updateConfig("channels", channels);
+}
+
+// 自动读取豆包桥接的最新令牌与授权状态: 打开生成面板即检测; 令牌变化自动同步到渠道 API Key;
+// 桥接离线或未授权时自动拉起宿主续期一次, 并提供手动重试。
+function DoubaoBridgeStatus({ config, theme }: { config: AiConfig; theme: CanvasTheme }) {
+    const { t } = useTranslation();
+    const [status, setStatus] = useState<DoubaoStatus | null>(null);
+    const [loading, setLoading] = useState(true);
+    const [renewing, setRenewing] = useState(false);
+    const [done, setDone] = useState(false);
+    const autoRenewed = useRef(false);
+
+    const apply = (result: DoubaoStatus) => {
+        setStatus(result);
+        setLoading(false);
+        setRenewing(false);
+        syncDoubaoToken(result.token || config.apiKey);
+    };
+
+    const check = async () => {
+        try {
+            apply(await fetchDoubaoStatus());
+        } catch {
+            setStatus(null);
+            setLoading(false);
+            setRenewing(false);
+        }
+    };
+
+    const renew = async () => {
+        setRenewing(true);
+        setDone(false);
+        try {
+            const result: DoubaoRenewResult = await renewDoubao(150000);
+            apply(result);
+            setDone(true);
+        } catch {
+            setRenewing(false);
+            setDone(true);
+        }
+    };
+
+    useEffect(() => {
+        let disposed = false;
+        (async () => {
+            let current: DoubaoStatus;
+            try {
+                current = await fetchDoubaoStatus();
+            } catch {
+                setLoading(false);
+                return;
+            }
+            if (disposed) return;
+            setStatus(current);
+            setLoading(false);
+            syncDoubaoToken(current.token || config.apiKey);
+            // 桥接离线或未授权 → 自动续期一次 (宿主已在跑则不做, 刷新一次状态即可)。
+            if (!current.online || !current.licenseActive) {
+                if (!autoRenewed.current && current.hostPresent && current.hostRunning !== true) {
+                    autoRenewed.current = true;
+                    setRenewing(true);
+                    try {
+                        const result = await renewDoubao(150000);
+                        if (!disposed) {
+                            apply(result);
+                            setDone(true);
+                        }
+                    } catch {
+                        if (!disposed) {
+                            setRenewing(false);
+                            setDone(true);
+                        }
+                    }
+                } else {
+                    setDone(true);
+                }
+            }
+        })();
+        return () => {
+            disposed = true;
+        };
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+
+    const renewingView = (
+        <SettingGroup title={t("settingsPanels.video.doubaoStatus")} color={theme.node.muted}>
+            <div className="rounded-xl border p-2.5 text-sm" style={{ borderColor: theme.node.stroke, color: theme.node.text }}>
+                <div className="flex items-center gap-2">
+                    <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-amber-400" />
+                    {t("settingsPanels.video.doubaoRenewing")}
+                </div>
+            </div>
+        </SettingGroup>
+    );
+
+    if (loading || renewing) return renewingView;
+
+    const online = Boolean(status?.online);
+    const licenseActive = Boolean(status?.licenseActive);
+    const color = online && licenseActive ? "#34d399" : online ? "#fbbf24" : "#f87171";
+    const stateText = online && licenseActive
+        ? t("settingsPanels.video.doubaoReady", { accounts: status?.accounts ?? 0, version: status?.version || "-" })
+        : online
+          ? t("settingsPanels.video.doubaoNoLicense")
+          : t("settingsPanels.video.doubaoOffline");
+
+    return (
+        <SettingGroup title={t("settingsPanels.video.doubaoStatus")} color={theme.node.muted}>
+            <div className="rounded-xl border p-2.5 text-sm" style={{ borderColor: theme.node.stroke, color: theme.node.text }}>
+                <div className="flex items-center gap-2">
+                    <span className="inline-block h-2 w-2 rounded-full" style={{ background: color }} />
+                    <span className="min-w-0 flex-1 truncate">{stateText}</span>
+                    <button
+                        type="button"
+                        className="shrink-0 cursor-pointer rounded-full border px-2.5 py-0.5 text-xs transition hover:opacity-80"
+                        style={{ borderColor: theme.node.stroke, color: theme.node.text }}
+                        onMouseDown={(event) => event.stopPropagation()}
+                        onClick={online && licenseActive ? check : renew}
+                    >
+                        {t("settingsPanels.video.doubaoRenew")}
+                    </button>
+                </div>
+                {!online && status?.hostRunning && (
+                    <div className="mt-2 text-xs opacity-70">{t("settingsPanels.video.doubaoHostRunningHint")}</div>
+                )}
+                {done && !online && (
+                    <div className="mt-2 text-xs opacity-70">{t("settingsPanels.video.doubaoRenewFailed")}</div>
+                )}
+            </div>
+        </SettingGroup>
     );
 }
 
 function SeedanceVideoSettingsPanel({ config, onConfigChange, theme, showTitle, className }: VideoSettingsPanelProps) {
     const { t } = useTranslation();
     const resolution = normalizeSeedanceResolution(config.vquality);
-    const ratio = normalizeSeedanceRatio(config.size);
+    const ratio = normalizeSeedanceRatio(resolveVideoRatio(config));
     const duration = normalizeSeedanceDuration(config.videoSeconds);
     const generateAudio = boolConfig(config.videoGenerateAudio, true);
     const watermark = boolConfig(config.videoWatermark, false);
@@ -183,7 +336,16 @@ export function videoSizeLabel(value: string) {
 
 export function videoSecondsLabel(value: string) {
     if (String(value).trim() === "-1") return i18n.t("settingsPanels.video.smart");
-    return `${value || "5"}s`;
+    return `${value || "6"}s`;
+}
+
+export function isLocalDolaVideo(config: Pick<AiConfig, "baseUrl" | "model" | "videoModel">) {
+    const model = (config.model || config.videoModel || "").toLowerCase();
+    return model === "dola-video" || /(?:127\.0\.0\.1|localhost):8088/i.test(config.baseUrl);
+}
+
+export function isDoubaoVideo(config: Pick<AiConfig, "baseUrl" | "apiFormat">) {
+    return config.apiFormat === "doubao" || config.baseUrl.includes("doubao-proxy") || /(?:127\.0\.0\.1|localhost):17777/i.test(config.baseUrl);
 }
 
 export function normalizeVideoSizeValue(value: string) {

@@ -1,12 +1,16 @@
 import axios from "axios";
 
 import i18n from "@/i18n";
-import { buildApiUrl, resolveModelRequestConfig, resolveModelScript, type AiConfig, type ModelChannel } from "@/stores/use-config-store";
+import { buildApiUrl, modelOptionName, resolveModelRequestConfig, resolveModelScript, type AiConfig, type ModelChannel } from "@/stores/use-config-store";
 import { normalizePluginImages, runModelPlugin } from "./model-plugin";
 import { nanoid } from "nanoid";
 import { dataUrlToFile, getDataUrlByteSize } from "@/lib/image-utils";
 import { buildImageReferencePromptText } from "@/lib/image-reference-prompt";
+import { guardReferenceImages } from "@/lib/face-guard";
 import { imageToDataUrl } from "@/services/image-storage";
+import { channelKey, noteRateLimit, retryWithKeyRotation } from "./key-pool";
+import { requireLogin } from "@/stores/use-auth-store";
+import { maybeRefundGeneration } from "./site";
 import type { ReferenceImage } from "@/types/image";
 
 const apiText = (key: string, options?: Record<string, unknown>) => i18n.t(`apiErrors.${key}`, options);
@@ -75,6 +79,12 @@ type ImageApiResponse = {
     error?: { message?: string };
     code?: number;
     msg?: string;
+};
+type ImageTaskResponse = ImageApiResponse & {
+    id?: string;
+    status?: string;
+    progress?: number;
+    dola_message?: string | null;
 };
 type GeminiPart = {
     text?: string;
@@ -233,12 +243,15 @@ function supportsGeminiImageSize(model: string) {
     return value.includes("gemini-3") || value.includes("3.1") || value.includes("3-pro");
 }
 
-function resolveImageDataUrl(item: Record<string, unknown>) {
+function resolveImageSource(item: Record<string, unknown>) {
     if (typeof item.b64_json === "string" && item.b64_json) {
         return `data:image/png;base64,${item.b64_json}`;
     }
     if (typeof item.url === "string" && item.url) {
         return item.url;
+    }
+    for (const key of ["no_watermark_url", "download_url", "image_url"]) {
+        if (typeof item[key] === "string" && item[key]) return item[key] as string;
     }
     return null;
 }
@@ -252,11 +265,10 @@ function parseImagePayload(payload: ImageApiResponse) {
         || (payload as Record<string, unknown>).images as Array<Record<string, unknown>> | undefined
         || (payload as Record<string, unknown>).results as Array<Record<string, unknown>> | undefined
         || [];
-    const images =
-        imageList
-            .map(resolveImageDataUrl)
-            .filter((value): value is string => Boolean(value))
-            .map((dataUrl) => ({ id: nanoid(), dataUrl }));
+    const images = imageList
+        .map(resolveImageSource)
+        .filter((value): value is string => Boolean(value))
+        .map((dataUrl) => ({ id: nanoid(), dataUrl }));
 
     if (images.length === 0) {
         // Check whether the response contains data in an unrecognized format.
@@ -267,6 +279,204 @@ function parseImagePayload(payload: ImageApiResponse) {
     }
 
     return images;
+}
+
+function isImageTaskPayload(payload: unknown): payload is ImageTaskResponse {
+    if (!payload || typeof payload !== "object") return false;
+    const value = payload as ImageTaskResponse;
+    return typeof value.id === "string" && typeof value.status === "string";
+}
+
+async function requestOpenAIImages(config: AiConfig, body: Record<string, unknown>, options?: RequestOptions) {
+    const response = await axios.post<ImageTaskResponse>(aiApiUrl(config, "/images/generations"), body, {
+        headers: aiHeaders(config, "application/json"),
+        signal: options?.signal,
+    });
+    if (!isImageTaskPayload(response.data)) return parseImagePayload(response.data);
+
+    const task = response.data;
+    const initialStatus = (task.status || "").toLowerCase();
+    if (!["pending", "queued", "processing", "running", "in_progress"].includes(initialStatus)) return parseImagePayload(task);
+    for (let attempt = 0; attempt < 120; attempt += 1) {
+        if (options?.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+        await delay(2500, options?.signal);
+        const state = (await axios.get<ImageTaskResponse>(aiApiUrl(config, `/images/tasks/${encodeURIComponent(task.id!)}`), { headers: aiHeaders(config), signal: options?.signal })).data;
+        const status = (state.status || "").toLowerCase();
+        if (["failed", "cancelled", "canceled", "error"].includes(status)) throw new Error(readApiErrorMessage(state.error) || state.dola_message || apiText("requestFailed"));
+        if (["completed", "succeeded", "success", "done"].includes(status)) return parseImagePayload(state);
+    }
+    throw new Error(apiText("videoTimeout", { provider: "图片" }));
+}
+
+function isLocalDolaImage(config: AiConfig) {
+    return modelOptionName(config.model || config.imageModel).toLowerCase() === "dola-image" || /(?:127\.0\.0\.1|localhost):8088/i.test(config.baseUrl);
+}
+
+function localDolaImageSize(size: string) {
+    const value = size.trim().toLowerCase();
+    if (value === "9:16" || value === "2:3" || value === "3:4" || value === "1024x1792" || value === "1024x1536" || value === "1024x1360") return "1024x1792";
+    if (value === "16:9" || value === "3:2" || value === "4:3" || value === "1792x1024" || value === "1536x1024" || value === "1360x1024") return "1792x1024";
+    return "1024x1024";
+}
+
+// dola(豆包账号管理器, /dola-proxy 反代) 异步图片任务: POST /images/generations 建任务, GET /images/tasks/{id} 轮询;
+// status 依次 pending → submitting → succeeded/failed, 结果在 data[] 的 no_watermark_url(优先)或 url。
+const DOLA_POLL_DELAY_MS = 2500;
+const DOLA_POLL_MAX_ATTEMPTS = 240;
+
+// dola-image 只接受 1024x1024 / 1024x1792 / 1792x1024 三种尺寸; 把请求比例就近吸附过去。
+const DOLA_IMAGE_SIZES: Array<[string, number]> = [
+    ["1792x1024", 1792 / 1024],
+    ["1024x1024", 1],
+    ["1024x1792", 1024 / 1792],
+];
+
+function dolaImageSize(size: string) {
+    const match = size.trim().match(/^(\d+)[x:](\d+)$/);
+    const target = match ? Number(match[1]) / Number(match[2]) : 1;
+    return DOLA_IMAGE_SIZES.reduce((best, item) => (Math.abs(item[1] - target) < Math.abs(best[1] - target) ? item : best))[0];
+}
+
+type DolaTaskResponse = {
+    id?: string;
+    status?: string;
+    error?: { message?: string } | string | null;
+    data?: Array<string | { url?: string; no_watermark_url?: string }> | null;
+};
+
+/** dola keeps the task body untouched on failures, so a body-level error can arrive with HTTP 200. */
+function assertDolaOk(task: DolaTaskResponse) {
+    if (dolaErrorMessage(task)) throw new Error(dolaErrorMessage(task));
+}
+
+function dolaErrorMessage(task: DolaTaskResponse) {
+    return (typeof task.error === "string" ? task.error : task.error?.message) || "";
+}
+
+function dolaTaskSucceeded(task: DolaTaskResponse) {
+    return ["succeeded", "completed", "success"].includes((task.status || "").toLowerCase());
+}
+
+function dolaTaskFailed(task: DolaTaskResponse) {
+    return ["failed", "error", "cancelled", "expired"].includes((task.status || "").toLowerCase());
+}
+
+async function requestDolaImages(config: AiConfig, prompt: string, references: ReferenceImage[], count: number, options?: RequestOptions) {
+    // dola 渠道失败自动重试: 隧道/上游抖动导致的中断重提常可成功, 次数由渠道设置控制(0 = 不重试)。
+    const retries = Math.max(0, Math.min(5, Math.floor(Number(config.retryLimit) || 0)));
+    for (let attempt = 0; ; attempt += 1) {
+        try {
+            return await requestDolaImagesOnce(config, prompt, references, count, options);
+        } catch (error) {
+            if (attempt >= retries || options?.signal?.aborted || (error instanceof DOMException && error.name === "AbortError")) throw error;
+            await delay(2000, options?.signal);
+        }
+    }
+}
+
+// dola 参考图需经本站转公网链接再由 dola 桌面端经隧道拉取。未超过 /api/ref-upload 20MB 上限的
+// 原图原样上传不做任何压缩; 只有超限时才逐步降采样并转 JPEG(质量 0.92), 直到满足上限。
+const DOLA_REFERENCE_MAX_BYTES = 19 * 1024 * 1024; // PHP 上限 20MB, 留 1MB 余量
+
+export async function compressDolaReference(image: ReferenceImage) {
+    const dataUrl = await imageToDataUrl(image);
+    if (!dataUrl) throw new Error(apiText("referenceImageReadFailed"));
+    if (!dataUrl.startsWith("data:image/")) return dataUrl;
+    if (getDataUrlByteSize(dataUrl) <= DOLA_REFERENCE_MAX_BYTES) return dataUrl;
+    try {
+        const source = new Image();
+        source.src = dataUrl;
+        await source.decode();
+        let scale = Math.min(1, 4096 / Math.max(source.naturalWidth, source.naturalHeight));
+        for (;;) {
+            const width = Math.max(1, Math.round(source.naturalWidth * scale));
+            const height = Math.max(1, Math.round(source.naturalHeight * scale));
+            const canvas = document.createElement("canvas");
+            canvas.width = width;
+            canvas.height = height;
+            const context = canvas.getContext("2d");
+            if (!context) return dataUrl;
+            context.fillStyle = "#ffffff";
+            context.fillRect(0, 0, width, height);
+            context.drawImage(source, 0, 0, width, height);
+            const encoded = canvas.toDataURL("image/jpeg", 0.92);
+            if (getDataUrlByteSize(encoded) <= DOLA_REFERENCE_MAX_BYTES || (width <= 640 && height <= 640)) return encoded;
+            scale *= 0.8;
+        }
+    } catch {
+        return dataUrl;
+    }
+}
+
+async function requestDolaImagesOnce(config: AiConfig, prompt: string, references: ReferenceImage[], count: number, options?: RequestOptions) {
+    const requestSize = dolaImageSize(config.size);
+    const images = await Promise.all(
+        references.map(async (image) => {
+            if (/^https?:\/\//i.test(image.dataUrl)) return image.dataUrl;
+            try {
+                return await uploadReferenceImageUrl({ ...image, dataUrl: await compressDolaReference(image) }, options?.signal);
+            } catch (error) {
+                if (axios.isCancel(error) || (error instanceof DOMException && error.name === "AbortError")) throw error;
+                throw new Error(apiText("duomiReferenceUploadFailed", { message: error instanceof Error ? error.message : String(error) }));
+            }
+        }),
+    );
+    const created = await axios.post<DolaTaskResponse>(
+        aiApiUrl(config, "/images/generations"),
+        {
+            model: config.model,
+            prompt: withSystemPrompt(config, prompt),
+            n: count,
+            ...(requestSize ? { size: requestSize } : {}),
+            ...(images.length ? { image_urls: images } : {}),
+        },
+        { headers: aiHeaders(config, "application/json"), signal: options?.signal },
+    );
+    assertDolaOk(created.data);
+    if (!created.data.id) throw new Error(apiText("dolaNoTaskId"));
+    for (let attempt = 0; attempt < DOLA_POLL_MAX_ATTEMPTS; attempt += 1) {
+        if (options?.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+        const response = await axios.get<DolaTaskResponse>(aiApiUrl(config, `/images/tasks/${encodeURIComponent(created.data.id)}`), { headers: aiHeaders(config), signal: options?.signal });
+        assertDolaOk(response.data);
+        if (dolaTaskSucceeded(response.data)) return parseDolaImages(response.data);
+        if (dolaTaskFailed(response.data)) throw new Error(dolaErrorMessage(response.data) || apiText("dolaGenerationFailed"));
+        if (attempt === DOLA_POLL_MAX_ATTEMPTS - 1) throw new Error(apiText("dolaTimeout"));
+        await delay(DOLA_POLL_DELAY_MS, options?.signal);
+    }
+    throw new Error(apiText("dolaTimeout"));
+}
+
+function parseDolaImages(task: DolaTaskResponse) {
+    const images = (task.data || [])
+        .map((item) => (typeof item === "string" ? item : item?.no_watermark_url || item?.url || ""))
+        .map((url) => rewriteDolaImageUrl(url))
+        .filter((url) => /^https?:\/\//i.test(url) || url.startsWith("/"))
+        .map((url) => ({ id: nanoid(), dataUrl: url }));
+    if (!images.length) throw new Error(apiText("dolaNoImage"));
+    return images;
+}
+
+// dola 图片在字节跳动 CDN(ibyteimg.com) 上, 广告拦截规则常屏蔽该域; 改写为本站 /dola-img/ 同源反代展示。
+function rewriteDolaImageUrl(url: string) {
+    return url.replace(/^https?:\/\/p16-flow-image-sign\.ibyteimg\.com\//i, "/dola-img/");
+}
+
+function delay(ms: number, signal?: AbortSignal) {
+    return new Promise<void>((resolve, reject) => {
+        if (signal?.aborted) {
+            reject(new DOMException("Aborted", "AbortError"));
+            return;
+        }
+        const timer = setTimeout(resolve, ms);
+        signal?.addEventListener(
+            "abort",
+            () => {
+                clearTimeout(timer);
+                reject(new DOMException("Aborted", "AbortError"));
+            },
+            { once: true },
+        );
+    });
 }
 
 function readApiErrorMessage(value: unknown): string {
@@ -302,6 +512,7 @@ function readApiErrorMessage(value: unknown): string {
 }
 
 function readAxiosError(error: unknown, fallback: string) {
+    noteRateLimit(error);
     if (axios.isCancel(error)) return apiText("requestCanceled");
     if (axios.isAxiosError(error)) {
         // 同源请求的 ERR_NETWORK 是连接闪断(移动网络/NAT 掐断长连接), 不是跨域; 文案要区分开。
@@ -350,7 +561,7 @@ function aiApiUrl(config: AiConfig, path: string) {
 
 function aiHeaders(config: AiConfig, contentType?: string) {
     return {
-        Authorization: `Bearer ${config.apiKey}`,
+        Authorization: `Bearer ${channelKey(config)}`,
         ...(contentType ? { "Content-Type": contentType } : {}),
     };
 }
@@ -373,7 +584,7 @@ function geminiApiUrl(config: Pick<AiConfig, "baseUrl" | "model">, action?: "gen
 
 function geminiHeaders(config: Pick<AiConfig, "apiKey">) {
     return {
-        "x-goog-api-key": config.apiKey,
+        "x-goog-api-key": channelKey(config),
         "Content-Type": "application/json",
     };
 }
@@ -741,7 +952,7 @@ type DuomiTaskResponse = {
 /** DuoMi uses the raw API key in the Authorization header (no "Bearer" prefix). */
 function duomiHeaders(config: Pick<AiConfig, "apiKey">, contentType?: string) {
     return {
-        Authorization: config.apiKey,
+        Authorization: channelKey(config),
         ...(contentType ? { "Content-Type": contentType } : {}),
     };
 }
@@ -756,69 +967,32 @@ async function requestDuomiImages(config: AiConfig, prompt: string, references: 
     return (await Promise.all(requests)).flat();
 }
 
-/** Some APIs (DuoMi, dola) only accept public URLs for reference images: pass URLs through and upload local ones to this site. */
-export async function uploadReferenceImage(image: ReferenceImage, signal?: AbortSignal) {
-    if (/^https?:\/\//i.test(image.dataUrl)) return image.dataUrl;
-    // 画布节点的 dataUrl 可能是 blob: 对象 URL(或仅有 storageKey), 先统一转成 data URL, 否则 dataUrlToFile 会得到空文件。
-    const dataUrl = await imageToDataUrl(image);
-    if (!dataUrl || !dataUrl.startsWith("data:")) throw new Error(apiText("referenceImageReadFailed"));
+/** Referencing APIs that require public URLs upload local images to the app's own origin first (DuoMi references, Agnes image-to-video). */
+export async function uploadReferenceImageUrl(image: ReferenceImage, signal?: AbortSignal) {
     const form = new FormData();
-    form.append("file", dataUrlToFile({ ...image, dataUrl }));
+    form.append("file", dataUrlToFile(image));
     const response = await fetch("/api/ref-upload", { method: "POST", body: form, signal });
     const payload = (await response.json().catch(() => null)) as { ok?: boolean; url?: string; msg?: string } | null;
     if (!response.ok || !payload?.ok || !payload.url) throw new Error(payload?.msg || apiText("httpFailed", { status: response.status }));
     return payload.url;
 }
 
-/** Wrap reference upload failures with a user-facing message, keeping cancel/abort untouched. */
-async function toPublicReferenceUrl(image: ReferenceImage, signal?: AbortSignal) {
-    try {
-        return await uploadReferenceImage(image, signal);
-    } catch (error) {
-        if (axios.isCancel(error) || (error instanceof DOMException && error.name === "AbortError")) throw error;
-        throw new Error(apiText("duomiReferenceUploadFailed", { message: error instanceof Error ? error.message : String(error) }));
-    }
-}
-
-// dola 参考图需经本站转公网链接再由 dola 桌面端经隧道拉取。未超过 /api/ref-upload 20MB 上限的
-// 原图原样上传不做任何压缩; 只有超限时才逐步降采样并转 JPEG(质量 0.92), 直到满足上限。
-const DOLA_REFERENCE_MAX_BYTES = 19 * 1024 * 1024; // PHP 上限 20MB, 留 1MB 余量
-
-export async function compressDolaReference(image: ReferenceImage) {
-    const dataUrl = await imageToDataUrl(image);
-    if (!dataUrl) throw new Error(apiText("referenceImageReadFailed"));
-    if (!dataUrl.startsWith("data:image/")) return dataUrl;
-    if (getDataUrlByteSize(dataUrl) <= DOLA_REFERENCE_MAX_BYTES) return dataUrl;
-    try {
-        const source = new Image();
-        source.src = dataUrl;
-        await source.decode();
-        let scale = Math.min(1, 4096 / Math.max(source.naturalWidth, source.naturalHeight));
-        for (;;) {
-            const width = Math.max(1, Math.round(source.naturalWidth * scale));
-            const height = Math.max(1, Math.round(source.naturalHeight * scale));
-            const canvas = document.createElement("canvas");
-            canvas.width = width;
-            canvas.height = height;
-            const context = canvas.getContext("2d");
-            if (!context) return dataUrl;
-            context.fillStyle = "#ffffff";
-            context.fillRect(0, 0, width, height);
-            context.drawImage(source, 0, 0, width, height);
-            const encoded = canvas.toDataURL("image/jpeg", 0.92);
-            if (getDataUrlByteSize(encoded) <= DOLA_REFERENCE_MAX_BYTES || (width <= 640 && height <= 640)) return encoded;
-            scale *= 0.8;
-        }
-    } catch {
-        return dataUrl;
-    }
-}
-
 async function requestDuomiImagesOnce(config: AiConfig, prompt: string, references: ReferenceImage[], options?: RequestOptions) {
     const quality = normalizeQuality(config.quality);
     const duomiQuality = quality === "low" || quality === "medium" || quality === "high" ? quality : undefined;
     const requestSize = resolveRequestSize(quality, config.size);
-    const images = await Promise.all(references.map((image) => toPublicReferenceUrl(image, options?.signal)));
+    // DuoMi only accepts public URLs for reference images: pass URLs through and upload local ones to this site.
+    const images = await Promise.all(
+        references.map(async (image) => {
+            if (/^https?:\/\//i.test(image.dataUrl)) return image.dataUrl;
+            try {
+                return await uploadReferenceImageUrl(image, options?.signal);
+            } catch (error) {
+                if (axios.isCancel(error) || (error instanceof DOMException && error.name === "AbortError")) throw error;
+                throw new Error(apiText("duomiReferenceUploadFailed", { message: error instanceof Error ? error.message : String(error) }));
+            }
+        }),
+    );
     const taskId = await createDuomiTask(config, prompt, images, duomiQuality, requestSize, options);
     return pollDuomiTask(config, taskId, options);
 }
@@ -862,128 +1036,65 @@ function parseDuomiTaskImages(task: DuomiTaskResponse) {
     return images;
 }
 
-// dola(豆包账号管理器) 异步图片任务: POST /images/generations 建任务, GET /images/tasks/{id} 轮询;
-// status 依次 pending → submitting → succeeded/failed, 结果在 data[] 的 no_watermark_url(优先)或 url。
-const DOLA_POLL_DELAY_MS = 2500;
-const DOLA_POLL_MAX_ATTEMPTS = 240;
+// Agnes AI 图像接口: 端点与 OpenAI 相同，但 size 用 1K/2K/3K/4K 档位配合 ratio，参考图 (支持 Data URI) 与 response_format 必须放进 extra_body——顶层 response_format 会被拒绝。
+const AGNES_IMAGE_RATIOS = ["1:1", "3:4", "4:3", "16:9", "9:16", "2:3", "3:2", "21:9"];
 
-// dola-image 只接受 1024x1024 / 1024x1792 / 1792x1024 三种尺寸; 把请求比例就近吸附过去。
-const DOLA_IMAGE_SIZES: Array<[string, number]> = [
-    ["1792x1024", 1792 / 1024],
-    ["1024x1024", 1],
-    ["1024x1792", 1024 / 1792],
-];
-
-function dolaImageSize(size: string) {
-    const match = size.trim().match(/^(\d+)[x:](\d+)$/);
-    const target = match ? Number(match[1]) / Number(match[2]) : 1;
-    return DOLA_IMAGE_SIZES.reduce((best, item) => (Math.abs(item[1] - target) < Math.abs(best[1] - target) ? item : best))[0];
-}
-
-type DolaTaskResponse = {
-    id?: string;
-    status?: string;
-    error?: { message?: string } | string | null;
-    data?: Array<string | { url?: string; no_watermark_url?: string }> | null;
-};
-
-/** dola keeps the task body untouched on failures, so a body-level error can arrive with HTTP 200. */
-function assertDolaOk(task: DolaTaskResponse) {
-    if (dolaErrorMessage(task)) throw new Error(dolaErrorMessage(task));
-}
-
-function dolaErrorMessage(task: DolaTaskResponse) {
-    return (typeof task.error === "string" ? task.error : task.error?.message) || "";
-}
-
-function dolaTaskSucceeded(task: DolaTaskResponse) {
-    return ["succeeded", "completed", "success"].includes((task.status || "").toLowerCase());
-}
-
-function dolaTaskFailed(task: DolaTaskResponse) {
-    return ["failed", "error", "cancelled", "expired"].includes((task.status || "").toLowerCase());
-}
-
-async function requestDolaImages(config: AiConfig, prompt: string, references: ReferenceImage[], count: number, options?: RequestOptions) {
-    // dola 渠道失败自动重试: 隧道/上游抖动导致的中断重提常可成功, 次数由渠道设置控制(0 = 不重试)。
-    const retries = Math.max(0, Math.min(5, Math.floor(Number(config.retryLimit) || 0)));
-    for (let attempt = 0; ; attempt += 1) {
-        try {
-            return await requestDolaImagesOnce(config, prompt, references, count, options);
-        } catch (error) {
-            if (attempt >= retries || options?.signal?.aborted || (error instanceof DOMException && error.name === "AbortError")) throw error;
-            await delay(2000, options?.signal);
-        }
+// 把画布的比例/像素尺寸设置归一到 Agnes 支持的 8 档宽高比，缺省 1:1。
+function agnesImageRatio(size: string) {
+    const value = size.trim();
+    if (!value || value.toLowerCase() === "auto") return "1:1";
+    const dimensions = parseImageDimensions(value);
+    if (!dimensions && !value.includes(":")) return "1:1";
+    try {
+        const parsed = parseImageRatio(dimensions ? `${dimensions.width}:${dimensions.height}` : value);
+        const target = parsed.width / parsed.height;
+        return AGNES_IMAGE_RATIOS.reduce((best, item) => {
+            const candidate = parseRatioValue(item);
+            return Math.abs(candidate.width / candidate.height - target) < Math.abs(parseRatioValue(best).width / parseRatioValue(best).height - target) ? item : best;
+        });
+    } catch {
+        return "1:1";
     }
 }
 
-async function requestDolaImagesOnce(config: AiConfig, prompt: string, references: ReferenceImage[], count: number, options?: RequestOptions) {
-    const requestSize = dolaImageSize(config.size);
-    const images = await Promise.all(
-        references.map(async (image) => {
-            if (/^https?:\/\//i.test(image.dataUrl)) return image.dataUrl;
-            return toPublicReferenceUrl({ ...image, dataUrl: await compressDolaReference(image) }, options?.signal);
-        }),
-    );
-    const created = await axios.post<DolaTaskResponse>(
+async function requestAgnesImages(config: AiConfig, prompt: string, references: ReferenceImage[], count: number, options?: RequestOptions) {
+    const requests = Array.from({ length: count }, () => requestAgnesImagesOnce(config, prompt, references, options));
+    return (await Promise.all(requests)).flat();
+}
+
+async function requestAgnesImagesOnce(config: AiConfig, prompt: string, references: ReferenceImage[], options?: RequestOptions) {
+    // 档位与 Gemini 一致: low/standard→1K, medium/hd→2K, high→4K; 未识别时按 1K。
+    const size = GEMINI_IMAGE_SIZE_BY_QUALITY[normalizeQuality(config.quality) || ""] || "1K";
+    const images = (await Promise.all(references.map((image) => imageToDataUrl(image, options)))).filter(Boolean);
+    const response = await axios.post<ImageApiResponse>(
         aiApiUrl(config, "/images/generations"),
         {
             model: config.model,
             prompt: withSystemPrompt(config, prompt),
-            n: count,
-            ...(requestSize ? { size: requestSize } : {}),
-            ...(images.length ? { image_urls: images } : {}),
+            size,
+            ratio: agnesImageRatio(config.size),
+            extra_body: {
+                ...(images.length ? { image: images } : {}),
+                response_format: "b64_json",
+            },
         },
         { headers: aiHeaders(config, "application/json"), signal: options?.signal },
     );
-    assertDolaOk(created.data);
-    if (!created.data.id) throw new Error(apiText("dolaNoTaskId"));
-    for (let attempt = 0; attempt < DOLA_POLL_MAX_ATTEMPTS; attempt += 1) {
-        if (options?.signal?.aborted) throw new DOMException("Aborted", "AbortError");
-        const response = await axios.get<DolaTaskResponse>(aiApiUrl(config, `/images/tasks/${encodeURIComponent(created.data.id)}`), { headers: aiHeaders(config), signal: options?.signal });
-        assertDolaOk(response.data);
-        if (dolaTaskSucceeded(response.data)) return parseDolaImages(response.data);
-        if (dolaTaskFailed(response.data)) throw new Error(dolaErrorMessage(response.data) || apiText("dolaGenerationFailed"));
-        if (attempt === DOLA_POLL_MAX_ATTEMPTS - 1) throw new Error(apiText("dolaTimeout"));
-        await delay(DOLA_POLL_DELAY_MS, options?.signal);
-    }
-    throw new Error(apiText("dolaTimeout"));
-}
-
-function parseDolaImages(task: DolaTaskResponse) {
-    const images = (task.data || [])
-        .map((item) => (typeof item === "string" ? item : item?.no_watermark_url || item?.url || ""))
-        .map((url) => rewriteDolaImageUrl(url))
-        .filter((url) => /^https?:\/\//i.test(url) || url.startsWith("/"))
-        .map((url) => ({ id: nanoid(), dataUrl: url }));
-    if (!images.length) throw new Error(apiText("dolaNoImage"));
-    return images;
-}
-
-// dola 图片在字节跳动 CDN(ibyteimg.com) 上, 广告拦截规则常屏蔽该域; 改写为本站 /dola-img/ 同源反代展示。
-function rewriteDolaImageUrl(url: string) {
-    return url.replace(/^https?:\/\/p16-flow-image-sign\.ibyteimg\.com\//i, "/dola-img/");
-}
-
-function delay(ms: number, signal?: AbortSignal) {
-    return new Promise<void>((resolve, reject) => {
-        if (signal?.aborted) {
-            reject(new DOMException("Aborted", "AbortError"));
-            return;
-        }
-        const timer = setTimeout(resolve, ms);
-        signal?.addEventListener(
-            "abort",
-            () => {
-                clearTimeout(timer);
-                reject(new DOMException("Aborted", "AbortError"));
-            },
-            { once: true },
-        );
-    });
+    return parseImagePayload(response.data);
 }
 
 export async function requestGeneration(config: AiConfig, prompt: string, options?: RequestOptions) {
+    // 商业站点无游客模式: 未登录弹出登录框并中断
+    if (!requireLogin()) throw new Error(apiText("loginRequired"));
+    try {
+        return await retryWithKeyRotation(config, () => requestGenerationOnce(config, prompt, options));
+    } catch (error) {
+        maybeRefundGeneration(config, config.model || config.imageModel, error);
+        throw error;
+    }
+}
+
+async function requestGenerationOnce(config: AiConfig, prompt: string, options?: RequestOptions) {
     const requestConfig = resolveModelRequestConfig(config, config.model || config.imageModel);
     const n = Math.max(1, Math.min(15, Math.floor(Math.abs(Number(config.count)) || 1)));
     const script = resolveModelScript(config, config.model || config.imageModel);
@@ -1020,6 +1131,13 @@ export async function requestGeneration(config: AiConfig, prompt: string, option
             throw new Error(readAxiosError(error, apiText("requestFailed")));
         }
     }
+    if (requestConfig.apiFormat === "agnes") {
+        try {
+            return await requestAgnesImages(requestConfig, prompt, [], n, options);
+        } catch (error) {
+            throw new Error(readAxiosError(error, apiText("requestFailed")));
+        }
+    }
     if (requestConfig.apiFormat === "dola") {
         try {
             return await requestDolaImages(requestConfig, prompt, [], n, options);
@@ -1031,24 +1149,18 @@ export async function requestGeneration(config: AiConfig, prompt: string, option
     const requestSize = resolveRequestSize(quality, config.size);
     const background = normalizeBackground(config.background);
     try {
-        const response = await axios.post<ImageApiResponse>(
-            aiApiUrl(requestConfig, "/images/generations"),
-            {
+        const images = await requestOpenAIImages(requestConfig, {
                 model: requestConfig.model,
                 prompt: withSystemPrompt(requestConfig, prompt),
-                n,
+                n: Math.min(4, n),
                 ...(quality ? { quality } : {}),
-                ...(requestSize ? { size: requestSize } : {}),
+                ...(requestSize ? { size: isLocalDolaImage(requestConfig) ? localDolaImageSize(requestConfig.size) : requestSize } : {}),
+                ...(isLocalDolaImage(requestConfig) ? { ratio: localDolaImageSize(requestConfig.size) === "1024x1792" ? "9:16" : localDolaImageSize(requestConfig.size) === "1792x1024" ? "16:9" : "1:1" } : {}),
                 ...(background ? { background } : {}),
-                response_format: "b64_json",
+                // gpt-image models reject response_format; they always return b64.
+                ...(/gpt-image/.test(requestConfig.model) ? {} : { response_format: "b64_json" }),
                 output_format: IMAGE_OUTPUT_FORMAT,
-            },
-            {
-                headers: aiHeaders(requestConfig, "application/json"),
-                signal: options?.signal,
-            },
-        );
-        const images = parseImagePayload(response.data);
+            }, options);
         return images;
     } catch (error) {
         throw new Error(readAxiosError(error, apiText("requestFailed")));
@@ -1056,15 +1168,27 @@ export async function requestGeneration(config: AiConfig, prompt: string, option
 }
 
 export async function requestEdit(config: AiConfig, prompt: string, references: ReferenceImage[], mask?: ReferenceImage, options?: RequestOptions) {
+    if (!requireLogin()) throw new Error(apiText("loginRequired"));
+    try {
+        return await retryWithKeyRotation(config, () => requestEditOnce(config, prompt, references, mask, options));
+    } catch (error) {
+        maybeRefundGeneration(config, config.model || config.imageModel, error);
+        throw error;
+    }
+}
+
+async function requestEditOnce(config: AiConfig, prompt: string, references: ReferenceImage[], mask?: ReferenceImage, options?: RequestOptions) {
     const requestConfig = resolveModelRequestConfig(config, config.model || config.imageModel);
+    // 防人脸拦截: 渠道开启时先给参考图眼部叠加干扰, 再走各协议分支。
+    const guardedReferences = await guardReferenceImages(requestConfig, references);
     const n = Math.max(1, Math.min(15, Math.floor(Math.abs(Number(config.count)) || 1)));
-    const requestPrompt = buildImageReferencePromptText(prompt, references);
+    const requestPrompt = buildImageReferencePromptText(prompt, guardedReferences);
     const script = resolveModelScript(config, config.model || config.imageModel);
     if (script) {
         const quality = normalizeQuality(config.quality);
         const requestSize = resolveRequestSize(quality, config.size);
         const background = normalizeBackground(config.background);
-        const refs = await Promise.all(references.map((image) => imageToDataUrl(image)));
+        const refs = await Promise.all(guardedReferences.map((image) => imageToDataUrl(image)));
         try {
             const result = await runModelPlugin({
                 capability: "image",
@@ -1080,10 +1204,27 @@ export async function requestEdit(config: AiConfig, prompt: string, references: 
             throw new Error(readAxiosError(error, apiText("requestFailed")));
         }
     }
+    if (isLocalDolaImage(requestConfig)) {
+        try {
+            const referenceImages = await Promise.all(guardedReferences.map((image) => imageToDataUrl(image, options)));
+            const images = await requestOpenAIImages(requestConfig, {
+                model: requestConfig.model,
+                prompt: withSystemPrompt(requestConfig, requestPrompt),
+                n: Math.min(4, n),
+                size: localDolaImageSize(requestConfig.size),
+                ratio: localDolaImageSize(requestConfig.size) === "1024x1792" ? "9:16" : localDolaImageSize(requestConfig.size) === "1792x1024" ? "16:9" : "1:1",
+                referenceImages,
+                output_format: IMAGE_OUTPUT_FORMAT,
+            }, options);
+            return images;
+        } catch (error) {
+            throw new Error(readAxiosError(error, apiText("requestFailed")));
+        }
+    }
     if (requestConfig.apiFormat === "gemini") {
         if (mask) throw new Error(apiText("geminiMaskUnsupported"));
         try {
-            return await requestGeminiImages(requestConfig, requestPrompt, references, n, options);
+            return await requestGeminiImages(requestConfig, requestPrompt, guardedReferences, n, options);
         } catch (error) {
             throw new Error(readAxiosError(error, apiText("requestFailed")));
         }
@@ -1094,7 +1235,7 @@ export async function requestEdit(config: AiConfig, prompt: string, references: 
         const quality = normalizeQuality(config.quality);
         const requestSize = resolveRequestSize(quality, config.size);
         const background = normalizeBackground(config.background);
-        const refs = await Promise.all(references.map((image) => imageToDataUrl(image)));
+        const refs = await Promise.all(guardedReferences.map((image) => imageToDataUrl(image)));
         try {
             const response = await axios.post<ImageApiResponse>(
                 aiApiUrl(requestConfig, "/images/generations"),
@@ -1123,7 +1264,16 @@ export async function requestEdit(config: AiConfig, prompt: string, references: 
     if (requestConfig.apiFormat === "duomi") {
         if (mask) throw new Error(apiText("maskModelUnsupported"));
         try {
-            return await requestDuomiImages(requestConfig, requestPrompt, references, n, options);
+            return await requestDuomiImages(requestConfig, requestPrompt, guardedReferences, n, options);
+        } catch (error) {
+            throw new Error(readAxiosError(error, apiText("requestFailed")));
+        }
+    }
+
+    if (requestConfig.apiFormat === "agnes") {
+        if (mask) throw new Error(apiText("maskModelUnsupported"));
+        try {
+            return await requestAgnesImages(requestConfig, requestPrompt, guardedReferences, n, options);
         } catch (error) {
             throw new Error(readAxiosError(error, apiText("requestFailed")));
         }
@@ -1132,7 +1282,7 @@ export async function requestEdit(config: AiConfig, prompt: string, references: 
     if (requestConfig.apiFormat === "dola") {
         if (mask) throw new Error(apiText("maskModelUnsupported"));
         try {
-            return await requestDolaImages(requestConfig, requestPrompt, references, n, options);
+            return await requestDolaImages(requestConfig, requestPrompt, guardedReferences, n, options);
         } catch (error) {
             throw new Error(readAxiosError(error, apiText("requestFailed")));
         }
@@ -1145,7 +1295,10 @@ export async function requestEdit(config: AiConfig, prompt: string, references: 
     formData.set("model", requestConfig.model);
     formData.set("prompt", withSystemPrompt(requestConfig, requestPrompt));
     formData.set("n", String(n));
-    formData.set("response_format", "b64_json");
+    // gpt-image models reject response_format; they always return b64.
+    if (!/gpt-image/.test(requestConfig.model)) {
+        formData.set("response_format", "b64_json");
+    }
     formData.set("output_format", IMAGE_OUTPUT_FORMAT);
     if (quality) {
         formData.set("quality", quality);
@@ -1156,13 +1309,13 @@ export async function requestEdit(config: AiConfig, prompt: string, references: 
     if (background) {
         formData.set("background", background);
     }
-    const files = await Promise.all(references.map(async (image) => dataUrlToFile({ ...image, dataUrl: await imageToDataUrl(image) })));
+    const files = await Promise.all(guardedReferences.map(async (image) => dataUrlToFile({ ...image, dataUrl: await imageToDataUrl(image) })));
     files.forEach((file) => formData.append("image", file));
     if (mask) formData.set("mask", dataUrlToFile(mask));
 
     try {
         const response = await axios.post<ImageApiResponse>(aiApiUrl(requestConfig, "/images/edits"), formData, { headers: aiHeaders(requestConfig), signal: options?.signal });
-        const images = parseImagePayload(response.data);
+        const images = await parseImagePayload(response.data);
         return images;
     } catch (error) {
         throw new Error(readAxiosError(error, apiText("requestFailed")));
@@ -1170,6 +1323,7 @@ export async function requestEdit(config: AiConfig, prompt: string, references: 
 }
 
 export async function requestImageQuestion(config: AiConfig, messages: AiTextMessage[], onDelta: (text: string) => void, options?: RequestOptions) {
+    if (!requireLogin()) throw new Error(apiText("loginRequired"));
     const requestConfig = resolveModelRequestConfig(config, config.model || config.textModel);
     const script = resolveModelScript(config, config.model || config.textModel);
     if (script) {
@@ -1209,6 +1363,13 @@ export async function requestImageQuestion(config: AiConfig, messages: AiTextMes
 
 export async function fetchImageModels(config: Pick<AiConfig, "baseUrl" | "apiKey" | "apiFormat">) {
     try {
+        // AutoDL 模型是手动添加的 ComfyUI 工作流、多米没有标准列表接口，都不支持自动拉取，主动给出明确提示。
+        if (config.apiFormat === "autodl" || config.apiFormat === "duomi") {
+            const protocolLabel = config.apiFormat === "autodl" ? "AutoDL" : i18n.t("config.protocols.duomi");
+            throw new Error(i18n.t("config.modelSelect.manualOnly", { protocol: protocolLabel }));
+        }
+        // 豆包管理器桥接没有模型列表接口，但模型是固定的（见 /health capabilities），拉取时直接返回这三个候选项，避免变成"手动添加"报错。
+        if (config.apiFormat === "doubao") return ["seedance2.0fast", "seedance2.0mini", "dreamina-seedance2.5"];
         if (config.apiFormat === "gemini") {
             const response = await axios.get<GeminiPayload>(geminiApiUrl({ ...defaultGeminiConfig, ...config }), { headers: geminiHeaders({ ...defaultGeminiConfig, ...config }) });
             validateGeminiPayload(response.data);
@@ -1217,9 +1378,20 @@ export async function fetchImageModels(config: Pick<AiConfig, "baseUrl" | "apiKe
                 .filter((id): id is string => Boolean(id))
                 .sort((a, b) => a.localeCompare(b));
         }
+        if (config.apiFormat === "mingze") {
+            const response = await axios.get<{ routes?: Array<{ model?: string }>; error?: { message?: string } }>(buildApiUrl(config.baseUrl, "/models"), {
+                headers: {
+                    Authorization: `Bearer ${channelKey(config)}`,
+                },
+            });
+            return (response.data.routes || [])
+                .map((route) => route.model)
+                .filter((id): id is string => Boolean(id))
+                .sort((a, b) => a.localeCompare(b));
+        }
         const response = await axios.get<{ data?: Array<{ id?: string }>; error?: { message?: string } }>(buildApiUrl(config.baseUrl, "/models"), {
             headers: {
-                Authorization: config.apiFormat === "duomi" ? config.apiKey : `Bearer ${config.apiKey}`,
+                Authorization: `Bearer ${channelKey(config)}`,
             },
         });
         return (response.data.data || [])

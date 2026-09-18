@@ -29,6 +29,21 @@ export const seedanceRatioOptions = [
     { value: "adaptive" },
 ] as const;
 
+export const seedanceRatioLabelKeys: Record<string, string> = { "16:9": "landscape", "9:16": "portrait", "1:1": "square", "4:3": "standardLandscape", "3:4": "standardPortrait", "21:9": "cinematic", adaptive: "adaptive" };
+
+/** 偏好设置与视频面板共用: 生视频默认画幅选项 (label 用 getter 保持语言热切换)。 */
+export const videoRatioOptions = seedanceRatioOptions.map((item) => ({
+    value: item.value,
+    get label() {
+        return item.value === "adaptive" ? i18n.t("settingsPanels.video.ratios.adaptive") : `${item.value} · ${i18n.t(`settingsPanels.video.ratios.${seedanceRatioLabelKeys[item.value]}`)}`;
+    },
+}));
+
+/** 生视频默认画幅统一读取入口: 偏好里的 videoRatio 优先, 未设置(旧数据/导入的旧配置)回退共用的 size。 */
+export function resolveVideoRatio(config: Pick<AiConfig, "size" | "videoRatio">) {
+    return config.videoRatio?.trim() || config.size || "";
+}
+
 export const seedanceDurationOptions = [-1, 4, 5, 6, 8, 10, 12, 15] as const;
 
 const seedancePixels = {

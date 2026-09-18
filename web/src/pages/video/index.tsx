@@ -12,13 +12,13 @@ import { PromptSelectDialog } from "@/components/prompts/prompt-select-dialog";
 import { VideoSettingsPanel, normalizeVideoResolutionValue, normalizeVideoSizeValue, videoSizeLabel } from "@/components/video-settings-panel";
 import { canvasThemes } from "@/lib/canvas-theme";
 import { formatBytes, formatDuration } from "@/lib/image-utils";
-import { boolConfig, isSeedanceVideoConfig, normalizeSeedanceRatio, seedanceReferenceLabel, seedanceVideoReferenceError, seedanceVideoReferenceHint, SEEDANCE_REFERENCE_LIMITS, SEEDANCE_VIDEO_MIME_TYPES } from "@/lib/seedance-video";
+import { boolConfig, isSeedanceVideoConfig, normalizeSeedanceRatio, resolveVideoRatio, seedanceReferenceLabel, seedanceVideoReferenceError, seedanceVideoReferenceHint, SEEDANCE_REFERENCE_LIMITS, SEEDANCE_VIDEO_MIME_TYPES } from "@/lib/seedance-video";
 import { deleteStoredMedia, resolveMediaUrl, uploadMediaFile } from "@/services/file-storage";
 import { resolveImageUrl, uploadImage } from "@/services/image-storage";
 import { createVideoGenerationTask, pollVideoGenerationTask, storeGeneratedVideo, type VideoGenerationTask } from "@/services/api/video";
 import { useAssetStore } from "@/stores/use-asset-store";
 import { useWorkbenchAgentStore } from "@/stores/use-workbench-agent-store";
-import { modelOptionLabel, useConfigStore, useEffectiveConfig, type AiConfig } from "@/stores/use-config-store";
+import { estimateGenerationPoints, modelOptionLabel, useConfigStore, useEffectiveConfig, type AiConfig } from "@/stores/use-config-store";
 import { useThemeStore } from "@/stores/use-theme-store";
 import type { ReferenceImage } from "@/types/image";
 import type { ReferenceAudio, ReferenceVideo } from "@/types/media";
@@ -63,7 +63,7 @@ type GenerationLog = {
     error?: string;
 };
 
-type GenerationLogConfig = Pick<AiConfig, "model" | "videoModel" | "size" | "vquality" | "videoSeconds" | "videoGenerateAudio" | "videoWatermark">;
+type GenerationLogConfig = Pick<AiConfig, "model" | "videoModel" | "size" | "videoRatio" | "vquality" | "videoSeconds" | "videoGenerateAudio" | "videoWatermark">;
 
 type UpdateAiConfig = <K extends keyof AiConfig>(key: K, value: AiConfig[K]) => void;
 
@@ -108,6 +108,8 @@ export default function VideoPage() {
 
     const model = effectiveConfig.videoModel || effectiveConfig.model;
     const canGenerate = Boolean(prompt.trim());
+    // 点数预估: 服务端渠道模型单价 (视频一次任务一个 POST, 按单价扣点)
+    const estimatePoints = estimateGenerationPoints(effectiveConfig, model);
 
     useEffect(() => {
         if (!running || !startedAt) return;
@@ -350,9 +352,10 @@ export default function VideoPage() {
         setStartedAt((value) => value || performance.now());
         setResults((value) => (value.length ? value : [{ id: log.id, status: "pending" }]));
         const taskConfig = buildVideoConfig({ ...effectiveConfig, ...log.config }, log.task.model || log.model);
-        // AutoDL H3 tasks can sit in the queue and render for ~20 minutes; poll them at a 5s interval.
-        const delayMs = log.task.provider === "seedance" || log.task.provider === "autodl" ? 5000 : 2500;
-        const maxAttempts = log.task.provider === "autodl" ? 240 : 120;
+        // 所有视频渠道统一允许最长约 30 分钟(1800s)的排队/渲染等待。
+        // 5s 间隔渠道需 360 次, 2.5s 间隔渠道需 720 次。
+        const delayMs = log.task.provider === "seedance" || log.task.provider === "autodl" || log.task.provider === "mingze" || log.task.provider === "doubao" ? 5000 : 2500;
+        const maxAttempts = log.task.provider === "seedance" || log.task.provider === "autodl" || log.task.provider === "mingze" || log.task.provider === "doubao" ? 360 : 720;
         try {
             for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
                 const state = await pollVideoGenerationTask(configOverride || taskConfig, log.task);
@@ -401,7 +404,14 @@ export default function VideoPage() {
         setVideoReferences(log.videoReferences || []);
         setAudioReferences(log.audioReferences || []);
         if (log.config.videoModel || log.model) updateConfig("videoModel", log.config.videoModel || log.model);
-        if (log.config.size) updateConfig("size", log.config.size);
+        // 比例按协议分流: seedance 系回填 videoRatio (不冲刷生图比例 size); 像素尺寸协议仍回填 size
+        const seedance = isSeedanceVideoConfig({ ...effectiveConfig, model: log.config.videoModel || log.model });
+        if (seedance) {
+            const ratio = log.config.videoRatio || log.config.size;
+            if (ratio) updateConfig("videoRatio", ratio);
+        } else if (log.config.size) {
+            updateConfig("size", log.config.size);
+        }
         if (log.config.vquality) updateConfig("vquality", log.config.vquality);
         if (log.config.videoSeconds) updateConfig("videoSeconds", log.config.videoSeconds);
         if (log.config.videoGenerateAudio) updateConfig("videoGenerateAudio", log.config.videoGenerateAudio);
@@ -550,7 +560,7 @@ export default function VideoPage() {
 
                             <div className="flex items-center justify-between rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-sm dark:border-stone-800 dark:bg-stone-900 sm:hidden">
                                 <span className="truncate text-stone-500 dark:text-stone-400">
-                                    {modelOptionLabel(effectiveConfig, model)} · {normalizeResolution(effectiveConfig.vquality)}p · {videoSizeLabel(effectiveConfig.size)} · {normalizeVideoSeconds(effectiveConfig.videoSeconds)}s
+                                    {modelOptionLabel(effectiveConfig, model)} · {normalizeResolution(effectiveConfig.vquality)}p · {videoSizeLabel(isSeedanceVideoConfig({ ...effectiveConfig, model }) ? resolveVideoRatio(effectiveConfig) : effectiveConfig.size)} · {normalizeVideoSeconds(effectiveConfig.videoSeconds)}s
                                 </span>
                                 <Button size="small" type="text" icon={<SlidersHorizontal className="size-4" />} onClick={() => setSettingsOpen(true)}>
                                     {t("workbench.adjust")}
@@ -566,6 +576,9 @@ export default function VideoPage() {
                             <Button type="primary" size="large" block icon={<Sparkles className="size-4" />} loading={running} disabled={!canGenerate || running} onClick={() => void generate()}>
                                 {t("workbench.generate")}
                             </Button>
+                            {estimatePoints != null ? (
+                                <div className="mt-2 text-center text-xs text-stone-500 dark:text-stone-400">{t("workbench.pointsEstimate", { count: estimatePoints })}</div>
+                            ) : null}
                         </div>
                     </div>
 
@@ -626,7 +639,14 @@ function GenerationSettings({ config, model, updateConfig, openConfigDialog }: {
                 <ModelPicker config={config} value={model} onChange={(value) => updateConfig("videoModel", value)} capability="video" fullWidth onMissingConfig={() => openConfigDialog(false)} />
             </label>
             <div className="col-span-2">
-                <VideoSettingsPanel config={config} onConfigChange={(key, value) => updateConfig(key, value)} theme={theme} showTitle={false} className="space-y-4" />
+                <VideoSettingsPanel
+                    config={config}
+                    // seedance 面板的比例键(size)改写进 videoRatio, 与生图比例分开; 像素尺寸协议仍写 size
+                    onConfigChange={(key, value) => updateConfig(key === "size" && isSeedanceVideoConfig({ ...config, model }) ? "videoRatio" : key, value)}
+                    theme={theme}
+                    showTitle={false}
+                    className="space-y-4"
+                />
             </div>
         </>
     );
@@ -877,6 +897,7 @@ function normalizeLogConfig(log: Partial<GenerationLog>): GenerationLogConfig {
         model: log.config?.model || log.model || "",
         videoModel: log.config?.videoModel || log.model || "",
         size: log.config?.size || log.size || "",
+        videoRatio: log.config?.videoRatio || "",
         vquality: normalizeResolution(log.config?.vquality || log.resolution || ""),
         videoSeconds: log.config?.videoSeconds || log.seconds || "",
         videoGenerateAudio: log.config?.videoGenerateAudio || "true",
@@ -889,6 +910,7 @@ function buildLog({ prompt, model, config, references, videoReferences, audioRef
         model: config.model,
         videoModel: config.videoModel,
         size: config.size,
+        videoRatio: resolveVideoRatio(config),
         vquality: normalizeResolution(config.vquality),
         videoSeconds: config.videoSeconds,
         videoGenerateAudio: config.videoGenerateAudio,
@@ -922,7 +944,7 @@ function buildVideoConfig(config: AiConfig, model: string): AiConfig {
         ...config,
         model,
         videoModel: model,
-        size: seedance ? normalizeSeedanceRatio(config.size) : normalizeVideoSize(config.size),
+        size: seedance ? normalizeSeedanceRatio(resolveVideoRatio(config)) : normalizeVideoSize(config.size),
         videoSeconds: normalizeVideoSeconds(config.videoSeconds),
         vquality: normalizeResolution(config.vquality),
         videoGenerateAudio: String(boolConfig(config.videoGenerateAudio, true)),
@@ -933,7 +955,7 @@ function buildVideoConfig(config: AiConfig, model: string): AiConfig {
 function normalizeVideoSeconds(value: string) {
     if (String(value).trim() === "-1") return "-1";
     const seconds = Math.floor(Number(value) || 6);
-    return String(Math.max(1, Math.min(20, seconds)));
+    return String(Math.max(1, Math.min(30, seconds)));
 }
 
 function normalizeVideoSize(value: string) {

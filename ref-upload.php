@@ -5,7 +5,7 @@ declare(strict_types=1);
  * 参考图上传接口：把浏览器本地参考图存到本站，返回可公开访问的 URL。
  * 用途：多米(duomiapi)等生图接口的参考图只接受公网链接，不支持 base64/dataURL。
  *
- * 请求：POST multipart/form-data，字段 file（图片，≤20MB）
+ * 请求：POST multipart/form-data，字段 file（图片，≤45MB；nginx 50m / post_max_size 50M，留 multipart 开销余量）
  * 响应：{"ok":true,"url":"https://<host>/ref-images/<name>"} 或 {"ok":false,"msg":"..."}
  * 说明：无鉴权（同源 Origin 校验 + 类型白名单 + 随机文件名），图片 3 天后懒清理。
  */
@@ -14,7 +14,7 @@ header('Content-Type: application/json; charset=utf-8');
 header('X-Content-Type-Options: nosniff');
 
 const UPLOAD_DIR = __DIR__ . '/ref-images';
-const MAX_BYTES = 20971520;       // 20MB
+const MAX_BYTES = 47185920;       // 45MB (nginx 50m / post_max_size 50M, 留 multipart 开销余量)
 const RETENTION_SECONDS = 259200; // 3 天
 
 function respond(int $code, array $data): void
@@ -59,7 +59,7 @@ if ($size <= 0) {
     respond(400, ['ok' => false, 'msg' => 'empty file (reference could not be read)']);
 }
 if ($size > MAX_BYTES) {
-    respond(413, ['ok' => false, 'msg' => 'file too large (max 20MB)']);
+    respond(413, ['ok' => false, 'msg' => 'file too large (max 45MB)']);
 }
 
 // 类型白名单：用 getimagesize 探测真实内容，防止伪装后缀

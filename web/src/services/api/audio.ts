@@ -4,6 +4,9 @@ import i18n from "@/i18n";
 import { audioMimeType, normalizeAudioFormatValue, normalizeAudioSpeedValue, normalizeAudioVoiceValue } from "@/lib/audio-generation";
 import { uploadMediaFile, type UploadedFile } from "@/services/file-storage";
 import { buildApiUrl, resolveModelRequestConfig, resolveModelScript, type AiConfig } from "@/stores/use-config-store";
+import { channelKey, noteRateLimit, retryWithKeyRotation } from "./key-pool";
+import { requireLogin } from "@/stores/use-auth-store";
+import { maybeRefundGeneration } from "./site";
 import { runModelPlugin } from "./model-plugin";
 
 type RequestOptions = { signal?: AbortSignal };
@@ -15,12 +18,24 @@ function aiApiUrl(config: AiConfig, path: string) {
 
 function aiHeaders(config: AiConfig) {
     return {
-        Authorization: `Bearer ${config.apiKey}`,
+        Authorization: `Bearer ${channelKey(config)}`,
         "Content-Type": "application/json",
     };
 }
 
 export async function requestAudioGeneration(config: AiConfig, prompt: string, options?: RequestOptions): Promise<Blob> {
+    // 商业站点无游客模式: 未登录弹出登录框并中断
+    if (!requireLogin()) throw new Error(apiText("loginRequired"));
+    try {
+        // 多 Key 渠道命中 429 时换号重试一次 (与 image/video 同一套 key-pool 封装)
+        return await retryWithKeyRotation(config, () => requestAudioGenerationOnce(config, prompt, options));
+    } catch (error) {
+        maybeRefundGeneration(config, config.model || config.audioModel, error);
+        throw error;
+    }
+}
+
+async function requestAudioGenerationOnce(config: AiConfig, prompt: string, options?: RequestOptions): Promise<Blob> {
     const requestConfig = resolveModelRequestConfig(config, config.model || config.audioModel);
     const model = requestConfig.model.trim();
     const format = normalizeAudioFormatValue(config.audioFormat);
@@ -133,6 +148,7 @@ function readApiErrorMessage(value: unknown): string {
 }
 
 function readAxiosError(error: unknown, fallback: string) {
+    noteRateLimit(error);
     if (axios.isCancel(error)) return apiText("requestCanceled");
     if (axios.isAxiosError(error)) {
         // 同源请求的 ERR_NETWORK 是连接闪断(移动网络/NAT 掐断长连接), 不是跨域; 文案要区分开。
