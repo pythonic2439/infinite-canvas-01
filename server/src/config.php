@@ -46,11 +46,15 @@ const DEFAULT_POINTS_BY_CAPABILITY = [
 ];
 
 // 本地代理路径 → 真实上游 (导入 0913 配置时, 配置里的相对路径映射回真实地址)
-const PROXY_BASE_MAP = [
-    '/autodl-proxy' => 'https://autodl.art',
-    '/duomi-proxy' => 'https://duomiapi.com',
-    '/ark-proxy/api/v3' => 'https://ark.cn-beijing.volces.com/api/v3',
-    '/mingze-proxy' => 'http://127.0.0.1:37651',
-    '/doubao-proxy' => 'http://127.0.0.1:17777',
-    '/dola-proxy' => 'http://[REMOVED-IP]:6007',
-];
+// dola 上游为服务器 IP+端口, 属部署环境信息, 不入库: 由环境变量 DOLA_UPSTREAM 提供
+function proxy_base_map(): array
+{
+    return [
+        '/autodl-proxy' => 'https://autodl.art',
+        '/duomi-proxy' => 'https://duomiapi.com',
+        '/ark-proxy/api/v3' => 'https://ark.cn-beijing.volces.com/api/v3',
+        '/mingze-proxy' => 'http://127.0.0.1:37651',
+        '/doubao-proxy' => 'http://127.0.0.1:17777',
+        '/dola-proxy' => (string) (getenv('DOLA_UPSTREAM') ?: ''),
+    ];
+}

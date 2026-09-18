@@ -50,7 +50,7 @@ foreach ($channels as $index => $channel) {
         $path = '/' . ltrim($baseUrl, '/');
         $path = preg_replace('#/api/v3$#', '/api/v3', $path) ?? $path;
         $mapped = null;
-        foreach (PROXY_BASE_MAP as $proxyPrefix => $upstream) {
+        foreach (proxy_base_map() as $proxyPrefix => $upstream) {
             if ($path === $proxyPrefix || str_starts_with($path, $proxyPrefix . '/')) {
                 $mapped = $upstream . substr($path, strlen($proxyPrefix));
                 break;

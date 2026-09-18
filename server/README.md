@@ -36,3 +36,6 @@ php server/bin/promote.php <email> [--revoke]
 - SMTP 未配置时注册收不到验证码 —— 先在管理后台填好 SMTP（QQ 邮箱/阿里云邮件推送等）
 - 单价默认值：image=1、video=10、text=1、audio=2 点；未登记的模型不计费
 - 鸣泽影坊(127.0.0.1:37651)/豆包桥接(127.0.0.1:17777)反代已配置，但上游服务必须在本机运行才可用
+- **dola 上游地址不入库**：`import-config.php` 映射 `/dola-proxy` 时读取环境变量 `DOLA_UPSTREAM`
+  （如 `http://<IP>:6007`），未设置则该映射为空；php-fpm 下用 `env[PHP]=...` 或脚本前 `export` 注入
+- 含真实 Key 的一次性脚本（如添加渠道）**禁止硬编码入库**——Key 一律走管理后台或环境变量
