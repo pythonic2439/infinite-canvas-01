@@ -21,7 +21,11 @@ ref-images/
 
 # 本地参考副本与个人本地配置
 infinite-canvas_local/
+local版本/
 .claude/
 
 # 含真实密钥/服务器信息的个人文档, 禁止入库
 dola_公网OpenAI_API调用说明.md
+bb-api-文生图图生图-完整流程手册.md
+# 多用户后端: SQLite 数据库与用户同步数据 (含密钥, 禁止入库)
+server/data/
