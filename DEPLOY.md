@@ -11,13 +11,19 @@
    ▼
 Nginx (本服务器)
    ├── /                      → 静态托管 /www/wwwroot/infinite-canvas/web/dist
-   ├── /api/v1/comfyui/       → 反代 https://autodl.art   (AutoDL ComfyUI API)
-   └── /autodl-proxy/         → 反代 https://autodl.art/  (同上，路径重写风格不同)
+   ├── /api/                  → PHP-FPM  server/api/index.php  (多用户后端: 登录/网关计费/云同步/管理)
+   ├── = /api/ref-upload      → ref-upload.php  (参考图转公网链接, 精确匹配优先于 /api/)
+   ├── /api/v1/comfyui/       → 反代 https://autodl.art   (AutoDL ComfyUI API, 前缀更长优先于 /api/)
+   ├── /autodl-proxy/         → 反代 https://autodl.art/  (同上，路径重写风格不同)
+   ├── /dola-proxy/ /duomi-proxy/ /dola-img/   (第三方接口/图床同源反代)
+   └── /ref-images/           → 参考图静态目录 (3 天懒清理)
 ```
 
-- **纯前端架构**：所有 AI 渠道配置（Base URL / API Key / 模型 / 参数模板）保存在**浏览器 localStorage**
-  （键 `infinite-canvas:ai_config_store`），服务器上没有任何 `.env` 或密钥文件。
-- **反向代理的作用**：规避浏览器直连 `autodl.art` 的 CORS / ERR_NETWORK 问题；`client_max_body_size 50m`
+- **架构**：前端 SPA。未登录为纯本地模式，AI 渠道配置（Base URL / API Key / 模型 / 参数模板）保存在
+  **浏览器 localStorage**（键 `infinite-canvas:ai_config_store`）；登录用户经 `/api/` 走多用户后端 ——
+  生成请求由网关 `/api/gw/{id}` 转发到真实上游，**真实渠道 Key 只存服务端 SQLite**，POST 且上游 2xx 才按模型点数扣费，
+  画布/工作台/素材数据云同步到 `server/data/users/{uid}/sync/`。
+- **反向代理的作用**：规避浏览器直连第三方接口的 CORS / ERR_NETWORK 问题；`client_max_body_size 50m`
   用于承载参考图 base64 请求体（数 MB 级）。
 - **SSL**：acme.sh 签发 Let's Encrypt ECC 证书，自动续期后自动 reload nginx。
 
@@ -30,6 +36,7 @@ Nginx (本服务器)
 | `docs/` | 文档站（Next.js/Fumadocs） |
 | `plugins/` | 画布插件源码（构建产物随 `web/dist/plugins/` 发布） |
 | `video_plugin_autodl_h3_字字动画/` | 字字动画宿主用的 AutoDL MiniMax-H3 视频 Python 插件（依赖宿主的 `plugin_utils.py`，本仓库内不可独立运行） |
+| `server/` | 多用户 PHP 后端（登录 / 点数网关计费 / 云同步 / 管理后台），线上经 `/api/` 由 PHP-FPM 运行；数据在 `server/data/`（不入库，见 `server/README.md`） |
 
 ## 2. 关键文件与路径
 
@@ -43,6 +50,8 @@ Nginx (本服务器)
 | acme.sh 域名配置 | `/root/.acme.sh/ai.01ai.space_ecc/` |
 | ACME 验证 webroot | `/www/wwwroot/infinite-canvas/web/acme`（HTTP-01 验证用） |
 | 访问日志 | `/www/wwwlogs/ai.01ai.space.log` |
+| 多用户后端入口 | `/www/wwwroot/infinite-canvas/server/api/index.php` |
+| 后端数据（SQLite + 用户同步，已 gitignore） | `/www/wwwroot/infinite-canvas/server/data`（属主必须为 `www:www`） |
 
 ## 3. 构建与发布
 
@@ -75,6 +84,9 @@ nginx -t && nginx -s reload
    - `proxy_pass https://autodl.art`，`proxy_set_header Host autodl.art`，`proxy_ssl_server_name on`；
    - 透传 `Authorization` 头（AutoDL 用裸 Token，不带 Bearer）；
    - `client_max_body_size 50m`、`proxy_read_timeout 300s`。
+6. **多用户后端**：`location /api/` → PHP-FPM 8.2（unix socket `/tmp/php-cgi-82.sock`），入口 `server/api/index.php`；
+   `location = /api/ref-upload`（参考图转公网链接）与 `/api/v1/comfyui/` 精确/更长前缀匹配，优先级更高不受影响。
+   `server/data` 目录属主必须为 `www:www`（php-fpm 以 www 运行，root 属主会导致写入 500）。
 
 ## 5. 应用内渠道配置（浏览器端）
 
@@ -146,5 +158,7 @@ cd /www/wwwroot/infinite-canvas/web && npm install && npm run build
 ## 7. 备份注意事项
 
 - 备份包含 **SSL 私钥**，请妥善保管，不要放到公开位置。
-- 备份不含 `web/node_modules`（731MB，`npm install` 可复原）、用户数据（画布内容/渠道配置均在各用户浏览器 localStorage）。
+- 备份不含 `web/node_modules`（`npm install` 可复原）。
+- **`server/data/`（SQLite 库 + 各用户云同步文件）不在 git 内，整机备份时需单独打包**；恢复后务必
+  `chown -R www:www server/data`，否则后端写入报 500。未登录用户的画布内容/渠道配置仍在各浏览器 localStorage。
 - 字字动画插件的令牌等参数由其宿主应用管理，不在本仓库备份范围内。
